@@ -1,0 +1,82 @@
+diff --git a/src/sanitize.mjs b/src/sanitize.mjs
+index 0c85dd5..c2588e2 100644
+--- a/src/sanitize.mjs
++++ b/src/sanitize.mjs
+@@ -26,6 +26,48 @@ const compactionError = (param) => new ShimError(400, 'encrypted_compaction_unsu
+   + 'Replay explicit history or a text summary, or use resource-affine upstream routing. '
+   + 'Strict mode rejects this state instead of silently removing it.', param);
+ 
++// Local patch 2026-10-26 (sentry-fix-v1): nested encrypted_content blocks
++// (e.g. inside agent_message.content[] or tool output arrays) are also bound
++// to the upstream resource that created them; replaying them to a different
++// resource fails with invalid_encrypted_content. Remove them wherever found.
++function hasNestedEncrypted(root) {
++  if (Array.isArray(root)) return root.some((value) => hasNestedEncrypted(value));
++  if (record(root)) {
++    if (string(root.encrypted_content)) return true;
++    return Object.values(root).some((value) => hasNestedEncrypted(value));
++  }
++  return false;
++}
++function removeNestedEncrypted(root) {
++  let removed = 0;
++  const visit = (node) => {
++    if (Array.isArray(node)) {
++      for (let i = node.length - 1; i >= 0; i--) {
++        const value = node[i];
++        if (record(value) && value.type === 'encrypted_content' && string(value.encrypted_content)) {
++          node.splice(i, 1);
++          removed++;
++        } else {
++          visit(value);
++        }
++      }
++      return;
++    }
++    if (record(node)) {
++      for (const key of Object.keys(node)) {
++        if (key === 'encrypted_content' && string(node[key])) {
++          delete node[key];
++          removed++;
++        } else {
++          visit(node[key]);
++        }
++      }
++    }
++  };
++  visit(root);
++  return removed;
++}
++
+ /** Pure, copy-on-write sanitizer; also usable directly in an SDK transport. */
+ export function sanitizeResponsesRequest(request, { strict = false } = {}) {
+   if (!record(request)) {
+@@ -56,6 +98,14 @@ export function sanitizeResponsesRequest(request, { strict = false } = {}) {
+     body.input = body.input.flatMap((item, index) => {
+       if (!record(item)) return [item];
+       const param = `input[${index}]`;
++      if (hasNestedEncrypted(item)) {
++        const cleaned = structuredClone(item);
++        const nestedRemoved = removeNestedEncrypted(cleaned);
++        if (nestedRemoved > 0) {
++          stats.nested_encrypted_blocks_removed = (stats.nested_encrypted_blocks_removed || 0) + nestedRemoved;
++          item = cleaned;
++        }
++      }
+       if (item.type === 'reasoning') {
+         // Removing just encrypted_content leaves a resource-bound reasoning ID.
+         stats.reasoning_items_removed++;
+diff --git a/src/server.mjs b/src/server.mjs
+index b8ff0d5..2df1407 100644
+--- a/src/server.mjs
++++ b/src/server.mjs
+@@ -271,7 +271,8 @@ export function createShimServer(options = {}) {
+         const decoded = await readJSON(req, config.maxBodyBytes);
+         const sanitized = sanitizeResponsesRequest(decoded.value, { strict: config.strict });
+         event.sanitized = sanitized.stats;
+-        changed = sanitized.stats.reasoning_items_removed > 0 || sanitized.stats.item_ids_removed > 0;
++        changed = sanitized.stats.reasoning_items_removed > 0 || sanitized.stats.item_ids_removed > 0
++          || (sanitized.stats.nested_encrypted_blocks_removed || 0) > 0;
+         bytes = changed ? Buffer.from(JSON.stringify(sanitized.body)) : decoded.raw;
+         if (bytes.length > config.maxBodyBytes) {
+           throw new ShimError(413, 'request_too_large', 'The sanitized request exceeds SHIM_MAX_BODY_BYTES.');
