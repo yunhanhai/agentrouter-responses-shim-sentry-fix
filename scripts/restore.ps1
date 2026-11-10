@@ -9,14 +9,19 @@ if (-not $npmRoot) { throw 'npm root -g failed. Is Node.js/npm installed?' }
 $srcDir = Join-Path (Join-Path $npmRoot $packageName) 'src'
 
 $restored = 0
-foreach ($file in @('sanitize.mjs', 'server.mjs')) {
+foreach ($file in @('sanitize.mjs', 'server.mjs', 'retry-cli.mjs', 'retry-routing.mjs')) {
+  $target = Join-Path $srcDir $file
   $backup = Join-Path $srcDir "$file.orig-2.0.1"
   if (Test-Path $backup) {
-    Copy-Item $backup (Join-Path $srcDir $file) -Force
+    Copy-Item $backup $target -Force
     Write-Host "[sentry-fix-v1] restored: $file"
     $restored++
+  } elseif (Test-Path $target) {
+    Remove-Item $target -Force
+    Write-Host "[sentry-fix-v1] removed file added by patch: $file"
+    $restored++
   } else {
-    Write-Host "[sentry-fix-v1] no backup found for $file (nothing to restore)"
+    Write-Host "[sentry-fix-v1] nothing to restore for $file"
   }
 }
 

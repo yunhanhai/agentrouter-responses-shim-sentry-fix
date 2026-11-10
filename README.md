@@ -9,6 +9,13 @@
 > `invalid_encrypted_content` → `response.failed` stream aborts on pooled
 > OpenAI-Responses-compatible gateways (e.g. AgentRouter).
 
+本仓库包含两个可叠加的本地补丁:
+
+| 补丁 | 内容 |
+|---|---|
+| `sentry-fix-v1` | 递归清理嵌套 `encrypted_content`,修复 `invalid_encrypted_content` → `response.failed` 流中断 |
+| `cursor-retry-v1` | `--retry-429` 429/5xx 自动重试(首字节前)、`--routes` 多上游前缀路由、`--proxy` 出站代理 |
+
 ---
 
 ## 症状
@@ -71,6 +78,54 @@ HTTP 层面是 `200`,失败发生在流内部,所以客户端只能看到「流�
 `Message Type: ... Payload:` 头部)会保留,对话可以正常继续。由于这些密文在池化
 网关下被证明不可跨资源解密,**删除是客户端侧唯一可行的修复路径**。
 
+## 修复内容(cursor-retry-v1:429 重试 / 多上游路由 / 出站代理)
+
+在 `sentry-fix-v1` 基础上新增 3 个可选能力(默认全部关闭,不传参数时行为与原版一致):
+
+| 参数 | 说明 |
+|---|---|
+| `--retry-429 N` | 遇到 **429/502/503/504** 时,在**首字节写出前**自动重试,最多 N 次(默认 0 = 关闭) |
+| `--retry-backoff-ms N` | 首次退避毫秒数,每次翻倍,默认 30000 |
+| `--retry-max-wait-ms N` | 退避上限,默认 180000 |
+| `--routes FILE` | 前缀路由文件,一个 shim 进程服务多个上游(多 provider 模式) |
+| `--proxy URL` | 出站 HTTP(S) 代理(CONNECT 隧道),可按路由单独配置 |
+
+对应环境变量:`SHIM_RETRY_429`、`SHIM_RETRY_BACKOFF_MS`、`SHIM_RETRY_MAX_WAIT_MS`、
+`SHIM_ROUTES_FILE`、`SHIM_PROXY`。
+
+### 重试行为
+
+- 只重试 **429 / 502 / 503 / 504**,且必须发生在**第一个响应字节之前**
+  (Azure/OpenAI 的限流在请求入口直接返回 429,正是这个窗口);
+- 退避为指数翻倍(8s → 16s → 32s → …),受 `--retry-max-wait-ms` 封顶;
+- 若上游返回 `Retry-After` 头(秒数或 HTTP 日期),**优先按它等待**;
+- 每次重试记录一条 `retry_429` 日志事件(含 attempt/等待时长/上游地址);
+- 客户端首字节超时(如 cc-switch 默认 120s)会限制总重试窗口,参数需与之匹配。
+
+### 多上游路由示例
+
+`routes.json`:
+
+```json
+{
+  "ga": { "upstream": "https://gateway-a.example.com/v1" },
+  "gb": { "upstream": "https://gateway-b.example.com/v1", "proxy": "http://127.0.0.1:7890" }
+}
+```
+
+启动与使用:
+
+```bash
+agentrouter-shim --routes routes.json --retry-429 4 --retry-backoff-ms 8000 --retry-max-wait-ms 30000 --port 18080
+```
+
+此时 `POST http://127.0.0.1:18080/ga/v1/responses` 会转发到
+`https://gateway-a.example.com/v1/responses`(前缀被剥离、`/v1` 自动归一)。
+各 provider 的 base_url 填 `http://127.0.0.1:18080/<前缀>/v1` 即可。
+
+> `--proxy` 走 undici(ProxyAgent,支持 h2),需要额外安装:
+> `npm install -g undici`。不装则仅在不使用 `--proxy` 时正常工作。
+
 ## 验证
 
 1. **单元验证**(`examples/demo.mjs`,无网络、无密钥):
@@ -96,14 +151,25 @@ HTTP 层面是 `200`,失败发生在流内部,所以客户端只能看到「流�
     "nested_encrypted_blocks_removed":22},"usage":{"input_tokens":117414,...},"status":200}
    ```
 
+4. **429 重试验证**(cursor-retry-v1):
+
+   - 合成测试:假上游连续返回 2 次 `429`(带 `Retry-After: 1`)→ shim 自动重试 →
+     第 3 次请求 `200`,客户端无感;日志出现两条 `retry_429` 事件(attempt 1/2,等待 1000ms)。
+   - 生产验证:上游真实返回 `429` 时,日志可见
+     `{"event":"retry_429","upstream_status":429,"attempt":1,"wait_ms":8000,...}`,
+     退避序列 8s → 16s → 30s → 30s。
+
 ## 目录结构
 
 ```
 ├── patches/
-│   └── sentry-fix-v1.patch     # 相对 npm 2.0.1 原版的标准 unified diff
+│   ├── sentry-fix-v1.patch     # 相对 npm 2.0.1 原版的标准 unified diff
+│   └── cursor-retry-v1.patch   # 在 sentry-fix-v1 之上叠加(429 重试/路由/代理)
 ├── src-patched/
 │   ├── sanitize.mjs            # 打好补丁的完整文件(可直接覆盖)
-│   └── server.mjs              # 打好补丁的完整文件(可直接覆盖)
+│   ├── server.mjs              # 打好补丁的完整文件(可直接覆盖)
+│   ├── retry-cli.mjs           # cursor-retry:CLI 参数解析
+│   └── retry-routing.mjs       # cursor-retry:路由 / 重试 / 代理实现
 ├── scripts/
 │   ├── apply.ps1               # Windows:自动定位全局包、备份、覆盖、重启
 │   └── restore.ps1             # 回滚到补丁前
@@ -126,12 +192,13 @@ npm install -g agentrouter-responses-shim
 pwsh -File .\scripts\apply.ps1
 ```
 
-脚本会:定位 `npm root -g` → 备份原文件为 `*.orig-2.0.1` → 覆盖 `src/` 两个文件 →
+脚本会:定位 `npm root -g` → 备份原文件为 `*.orig-2.0.1` → 覆盖 `src/` 四个文件
+(`sanitize.mjs`、`server.mjs`、`retry-cli.mjs`、`retry-routing.mjs`)→
 如果 shim 正在运行则重启它(配合守护脚本会自动拉起)。
 
 ### 方式 B:手动覆盖
 
-把 `src-patched/sanitize.mjs`、`src-patched/server.mjs` 复制到:
+把 `src-patched/` 下的四个文件复制到:
 
 ```
 $(npm root -g)/agentrouter-responses-shim/src/
@@ -144,6 +211,7 @@ $(npm root -g)/agentrouter-responses-shim/src/
 ```bash
 cd "$(npm root -g)/agentrouter-responses-shim"
 git apply /path/to/patches/sentry-fix-v1.patch
+git apply /path/to/patches/cursor-retry-v1.patch   # 可选:429 重试/路由/代理
 ```
 
 ### 验证补丁生效
@@ -166,6 +234,10 @@ pwsh -File .\scripts\restore.ps1
 - `npm install -g` 升级/重装该包会覆盖补丁,需重新应用(上游版本差异较大时,
   建议移植逻辑而不是整文件覆盖)。
 - 本补丁针对 `agentrouter-responses-shim@2.0.1` 编写并验证;其他版本需自行核对。
+- 429 重试只在**流式响应首字节之前**有效;流已经开始后无法重试(协议限制)。
+  总重试时长还受客户端首字节超时约束(例如 cc-switch 默认 120s),
+  `--retry-429`/退避参数需按实际超时预算调整。
+- `--proxy` 依赖 undici(`npm install -g undici`),未安装时不要使用该参数。
 
 ## 复现上游问题的最小步骤(用于给上游提 issue)
 

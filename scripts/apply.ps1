@@ -16,10 +16,10 @@ if (-not (Test-Path (Join-Path $srcDir 'sanitize.mjs'))) {
   throw "Package not found at $pkgDir. Install it first: npm install -g $packageName"
 }
 
-foreach ($file in @('sanitize.mjs', 'server.mjs')) {
+foreach ($file in @('sanitize.mjs', 'server.mjs', 'retry-cli.mjs', 'retry-routing.mjs')) {
   $target = Join-Path $srcDir $file
   $backup = "$target.orig-2.0.1"
-  if (-not (Test-Path $backup)) {
+  if ((Test-Path $target) -and -not (Test-Path $backup)) {
     Copy-Item $target $backup
     Write-Host "[sentry-fix-v1] backed up: $file -> $(Split-Path -Leaf $backup)"
   }

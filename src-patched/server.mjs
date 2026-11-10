@@ -4,6 +4,8 @@ import * as zlib from 'node:zlib';
 import { timingSafeEqual, randomUUID } from 'node:crypto';
 import { ShimError, sanitizeResponsesRequest } from './sanitize.mjs';
 import { createUsageObserver } from './usage.mjs';
+// cursor-retry extension (local patch): opt-in 429 retry + prefix routing + proxy.
+import { forwardWithRetry, resolveRoute } from './retry-routing.mjs';
 
 export const VERSION = '2.0.1';
 const LOOPBACK = new Set(['127.0.0.1', 'localhost', '::1', '[::1]']);
@@ -120,6 +122,25 @@ function routeRequest(req, config) {
   }
   const url = new URL(req.url, 'http://shim.invalid');
   if (url.pathname === '/healthz' && req.method === 'GET') return { health: true, path: '/healthz' };
+  // cursor-retry extension: in multi-route mode, strip the leading /<prefix>
+  // before the original path logic. Route resolution happens in the handler.
+  if (config.routes) {
+    try {
+      const resolved = resolveRoute(req.url, config.routes);
+      const inner = new URL(resolved.rest, 'http://shim.invalid');
+      const path = inner.pathname.replace(/^\/v1(?=\/)/, '').replace(/\/+$/, '');
+      if (req.method === 'GET' && path === '/responses') {
+        throw new ShimError(426, 'websocket_unsupported', 'This proxy supports HTTP/SSE. Select that transport in your client.');
+      }
+      if (req.method === 'POST' && ['/responses', '/responses/input_tokens', '/responses/compact'].includes(path)) {
+        return { path, search: inner.search, operation: true, routePrefix: resolved.route.prefix };
+      }
+      return { path: path || '/', search: inner.search, routePrefix: resolved.route.prefix };
+    } catch (error) {
+      if (error instanceof ShimError) throw error;
+      throw new ShimError(404, 'unknown_route', error.message || 'Unknown route prefix.');
+    }
+  }
   const path = url.pathname.replace(/^\/v1(?=\/)/, '').replace(/\/+$/, '');
   if (path === '/responses/compact' && req.method === 'POST' && config.mode === 'strip' && config.strict) {
     throw new ShimError(400, 'remote_compaction_unsupported',
@@ -250,7 +271,10 @@ export function createShimServer(options = {}) {
   const base = upstreamURL(config.upstreamBaseUrl);
   if (config.localApiKey && !config.upstreamApiKey) throw new Error('A local API key requires an upstream API key.');
   const log = config.logger ?? defaultLog;
-  const server = http.createServer(async (req, res) => {
+  // cursor-retry extension: retry/routing config rides on the same config object.
+  // When absent (Codex instance), everything below short-circuits to original behavior.
+  const retry = config.retry ?? null;
+  const routes = config.routes ?? null;  const server = http.createServer(async (req, res) => {
     const id = randomUUID();
     const started = Date.now();
     const event = { event: 'request', request_id: id, path: 'unsupported', method: req.method, mode: config.mode };
@@ -280,6 +304,31 @@ export function createShimServer(options = {}) {
       } else if (['POST', 'PUT', 'PATCH'].includes(req.method) || req.headers['content-length'] || req.headers['transfer-encoding']) {
         if (Number(req.headers['content-length']) > config.maxBodyBytes) throw new ShimError(413, 'request_too_large', 'The encoded request exceeds SHIM_MAX_BODY_BYTES.');
         bytes = await readLimited(req, config.maxBodyBytes);
+      }
+      // cursor-retry extension: multi-route mode picks the per-prefix upstream/proxy.
+      // Retry mode (retry429 > 0) uses forwardWithRetry; otherwise original forward().
+      if (retry && (retry.retry429 > 0 || routes)) {
+        const routeEntry = routes && route.routePrefix ? routes.get(route.routePrefix) : null;
+        forwardWithRetry({
+          req, res,
+          route: routeEntry ? {
+            prefix: routeEntry.prefix,
+            base: routeEntry.base,
+            proxy: routeEntry.proxy,
+            path: route.path,
+            search: route.search,
+          } : null,
+          routeFixed: { path: route.path, search: route.search },
+          body: bytes, changed, bearer, config, base,
+          retry: { retry429: retry.retry429, retryBackoffMs: retry.retryBackoffMs, retryMaxWaitMs: retry.retryMaxWaitMs, proxyUrl: retry.proxyUrl },
+          onError: (code) => { event.error_code = code; },
+          onMetrics: (metrics) => { Object.assign(event, metrics); },
+          sendError,
+          copyHeaders,
+          createUsageObserver,
+          log,
+        });
+        return;
       }
       forward(req, res, route, bytes, changed, bearer, config, base,
         (code) => { event.error_code = code; }, (metrics) => { Object.assign(event, metrics); });
