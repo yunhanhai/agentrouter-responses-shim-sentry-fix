@@ -24,6 +24,7 @@ export const RETRY_OPTIONS = {
   'retry-429': { type: 'string' },
   'retry-backoff-ms': { type: 'string' },
   'retry-max-wait-ms': { type: 'string' },
+  'max-images': { type: 'string' },
   routes: { type: 'string' },
   proxy: { type: 'string' },
 };
@@ -32,6 +33,7 @@ export const RETRY_ENV = {
   retry429: { env: 'SHIM_RETRY_429', fallback: 0 },
   retryBackoffMs: { env: 'SHIM_RETRY_BACKOFF_MS', fallback: 30000 },
   retryMaxWaitMs: { env: 'SHIM_RETRY_MAX_WAIT_MS', fallback: 180000 },
+  maxImages: { env: 'SHIM_MAX_IMAGES', fallback: 0 },
   routesFile: { env: 'SHIM_ROUTES_FILE', fallback: '' },
   proxyUrl: { env: 'SHIM_PROXY', fallback: '' },
 };
@@ -47,11 +49,14 @@ export function configFromOverrides(env = process.env, overrides = {}) {
   const retry429 = integer2(pick('retry-429', RETRY_ENV.retry429), 0, 'retry-429', 50);
   const retryBackoffMs = integer2(pick('retry-backoff-ms', RETRY_ENV.retryBackoffMs), 30000, 'retry-backoff-ms', 600000);
   const retryMaxWaitMs = integer2(pick('retry-max-wait-ms', RETRY_ENV.retryMaxWaitMs), 180000, 'retry-max-wait-ms', 3600000);
+  // image-limit extension: keep only the newest N images in replayed history.
+  // Gateways commonly cap images per request (e.g. 50); 0 disables the trim.
+  const maxImages = integer2(pick('max-images', RETRY_ENV.maxImages), 0, 'max-images', 1000);
   const routesFile = String(pick('routes', RETRY_ENV.routesFile) || '');
   const proxyUrl = String(pick('proxy', RETRY_ENV.proxyUrl) || '');
   const routes = routesFile ? loadRoutes(routesFile) : null;
   if (proxyUrl) proxyURL(proxyUrl); // validate early
-  return { retry429, retryBackoffMs, retryMaxWaitMs, routes, routesFile, proxyUrl };
+  return { retry429, retryBackoffMs, retryMaxWaitMs, maxImages, routes, routesFile, proxyUrl };
 }
 
 function integer2(value, fallback, name, maximum) {

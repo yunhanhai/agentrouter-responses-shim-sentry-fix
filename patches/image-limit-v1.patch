@@ -1,0 +1,184 @@
+diff --git a/bin/agentrouter-shim.mjs b/bin/agentrouter-shim.mjs
+index 159f1d8..f23e017 100644
+--- a/bin/agentrouter-shim.mjs
++++ b/bin/agentrouter-shim.mjs
+@@ -50,12 +50,13 @@ try {
+     if (retry) {
+       config.retry = retry;
+       config.routes = routes;
++      config.maxImages = retry.maxImages;
+     }
+     const server = createShimServer(config);
+     server.once('error', (error) => { log({ event: 'startup_error', code: error.code || 'listen_failed' }); process.exitCode = 1; });
+     server.listen(config.port, config.host, () => log({ event: 'listening', host: config.host, port: config.port,
+       upstream: config.upstreamBaseUrl, mode: config.mode, strict: config.strict, log_usage: config.logUsage, version: VERSION,
+-      ...(retry ? { retry429: retry.retry429, routes: routes ? routes.size : 0, proxy: retry.proxyUrl || null } : {}) }));
++      ...(retry ? { retry429: retry.retry429, max_images: retry.maxImages, routes: routes ? routes.size : 0, proxy: retry.proxyUrl || null } : {}) }));
+     let stopping = false;
+     const stop = () => {
+       if (stopping) return;
+diff --git a/src/retry-cli.mjs b/src/retry-cli.mjs
+index ff1794d..631df30 100644
+--- a/src/retry-cli.mjs
++++ b/src/retry-cli.mjs
+@@ -12,6 +12,8 @@ Cursor-retry patch options (all optional, default off):
+   --retry-429 N        Retry 429/502/503/504 before first upstream byte (default 0 = off)
+   --retry-backoff-ms N Initial backoff, doubles per attempt (default 30000)
+   --retry-max-wait-ms N Backoff ceiling (default 180000)
++  --max-images N       Keep only the newest N image blocks in replayed history,
++                       older ones become text placeholders (default 0 = off)
+   --routes FILE        JSON prefix-routing table (multi-upstream mode)
+   --proxy URL          Outbound http proxy via CONNECT (per-route "proxy" overrides)
+ 
+@@ -27,7 +29,7 @@ Client API base: http://127.0.0.1:18081/<prefix>/v1
+  *
+  * Returns { config, retry, routes } where:
+  *   - config is the original shim config (untouched fields)
+- *   - retry: { retry429, retryBackoffMs, retryMaxWaitMs, proxyUrl }
++ *   - retry: { retry429, retryBackoffMs, retryMaxWaitMs, maxImages, proxyUrl }
+  *   - routes: Map|null (prefix → { base: URL, proxy: URL|null })
+  */
+ export function applyRetryOptions(env, parsedValues, baseConfig) {
+@@ -35,6 +37,7 @@ export function applyRetryOptions(env, parsedValues, baseConfig) {
+     'retry-429': parsedValues['retry-429'],
+     'retry-backoff-ms': parsedValues['retry-backoff-ms'],
+     'retry-max-wait-ms': parsedValues['retry-max-wait-ms'],
++    'max-images': parsedValues['max-images'],
+     routes: parsedValues.routes,
+     proxy: parsedValues.proxy,
+   };
+diff --git a/src/retry-routing.mjs b/src/retry-routing.mjs
+index e8a2cb9..e3fa60f 100644
+--- a/src/retry-routing.mjs
++++ b/src/retry-routing.mjs
+@@ -24,6 +24,7 @@ export const RETRY_OPTIONS = {
+   'retry-429': { type: 'string' },
+   'retry-backoff-ms': { type: 'string' },
+   'retry-max-wait-ms': { type: 'string' },
++  'max-images': { type: 'string' },
+   routes: { type: 'string' },
+   proxy: { type: 'string' },
+ };
+@@ -32,6 +33,7 @@ export const RETRY_ENV = {
+   retry429: { env: 'SHIM_RETRY_429', fallback: 0 },
+   retryBackoffMs: { env: 'SHIM_RETRY_BACKOFF_MS', fallback: 30000 },
+   retryMaxWaitMs: { env: 'SHIM_RETRY_MAX_WAIT_MS', fallback: 180000 },
++  maxImages: { env: 'SHIM_MAX_IMAGES', fallback: 0 },
+   routesFile: { env: 'SHIM_ROUTES_FILE', fallback: '' },
+   proxyUrl: { env: 'SHIM_PROXY', fallback: '' },
+ };
+@@ -47,11 +49,14 @@ export function configFromOverrides(env = process.env, overrides = {}) {
+   const retry429 = integer2(pick('retry-429', RETRY_ENV.retry429), 0, 'retry-429', 50);
+   const retryBackoffMs = integer2(pick('retry-backoff-ms', RETRY_ENV.retryBackoffMs), 30000, 'retry-backoff-ms', 600000);
+   const retryMaxWaitMs = integer2(pick('retry-max-wait-ms', RETRY_ENV.retryMaxWaitMs), 180000, 'retry-max-wait-ms', 3600000);
++  // image-limit extension: keep only the newest N images in replayed history.
++  // Gateways commonly cap images per request (e.g. 50); 0 disables the trim.
++  const maxImages = integer2(pick('max-images', RETRY_ENV.maxImages), 0, 'max-images', 1000);
+   const routesFile = String(pick('routes', RETRY_ENV.routesFile) || '');
+   const proxyUrl = String(pick('proxy', RETRY_ENV.proxyUrl) || '');
+   const routes = routesFile ? loadRoutes(routesFile) : null;
+   if (proxyUrl) proxyURL(proxyUrl); // validate early
+-  return { retry429, retryBackoffMs, retryMaxWaitMs, routes, routesFile, proxyUrl };
++  return { retry429, retryBackoffMs, retryMaxWaitMs, maxImages, routes, routesFile, proxyUrl };
+ }
+ 
+ function integer2(value, fallback, name, maximum) {
+diff --git a/src/sanitize.mjs b/src/sanitize.mjs
+index c2588e2..90c4802 100644
+--- a/src/sanitize.mjs
++++ b/src/sanitize.mjs
+@@ -68,13 +68,75 @@ function removeNestedEncrypted(root) {
+   return removed;
+ }
+ 
++// image-limit extension (local patch 2026-11-13): gateways cap the number of
++// images per request (e.g. "Exceeded maximum number of images (50)"). Codex
++// replays every screenshot a long session ever produced, so trim older image
++// blocks and leave a text placeholder; tool pairings stay intact because only
++// content parts are replaced. Copy-on-write: no trim -> original input kept.
++const IMAGE_TYPES = new Set(['input_image', 'image', 'computer_screenshot']);
++const IMAGE_PLACEHOLDER = '[older image omitted to respect the upstream image limit]';
++const isImageBlock = (value) => record(value)
++  && (IMAGE_TYPES.has(value.type) || string(value.image_url))
++  && (string(value.image_url) || string(value.file_id) || string(value.image_base64));
++
++function trimExcessImages(body, maxImages, stats) {
++  if (!Array.isArray(body.input)) return;
++  // Pass 1: collect image-block references in document order (no mutation).
++  const slots = [];
++  const collect = (container) => {
++    if (!Array.isArray(container)) return;
++    for (let i = 0; i < container.length; i++) {
++      const value = container[i];
++      if (isImageBlock(value)) slots.push({ container, index: i });
++      else if (record(value)) {
++        for (const key of ['content', 'output']) collect(value[key]);
++      }
++    }
++  };
++  for (let i = 0; i < body.input.length; i++) {
++    const item = body.input[i];
++    if (isImageBlock(item)) slots.push({ container: body.input, index: i, topLevel: true });
++    else if (record(item)) for (const key of ['content', 'output']) collect(item[key]);
++  }
++  const excess = slots.length - maxImages;
++  if (excess <= 0) return;
++  // Pass 2: clone input, then replace the oldest `excess` blocks with text.
++  body.input = structuredClone(body.input);
++  const cloneSlots = [];
++  const collectClone = (container) => {
++    if (!Array.isArray(container)) return;
++    for (let i = 0; i < container.length; i++) {
++      const value = container[i];
++      if (isImageBlock(value)) cloneSlots.push({ container, index: i });
++      else if (record(value)) {
++        for (const key of ['content', 'output']) collectClone(value[key]);
++      }
++    }
++  };
++  for (let i = 0; i < body.input.length; i++) {
++    const item = body.input[i];
++    if (isImageBlock(item)) cloneSlots.push({ container: body.input, index: i, topLevel: true });
++    else if (record(item)) for (const key of ['content', 'output']) collectClone(item[key]);
++  }
++  for (const slot of cloneSlots.slice(0, excess)) {
++    if (slot.topLevel) {
++      slot.container[slot.index] = { type: 'message', role: 'user', content: [{ type: 'input_text', text: IMAGE_PLACEHOLDER }] };
++    } else {
++      slot.container[slot.index] = { type: 'input_text', text: IMAGE_PLACEHOLDER };
++    }
++  }
++  stats.images_removed = (stats.images_removed || 0) + excess;
++  stats.images_kept = maxImages;
++}
++
+ /** Pure, copy-on-write sanitizer; also usable directly in an SDK transport. */
+-export function sanitizeResponsesRequest(request, { strict = false } = {}) {
++export function sanitizeResponsesRequest(request, { strict = false, maxImages = 0 } = {}) {
+   if (!record(request)) {
+     throw new ShimError(400, 'invalid_json_object', 'The request body must be a JSON object.');
+   }
+   const body = { ...request };
+   const stats = { reasoning_items_removed: 0, item_ids_removed: 0, opaque_state_items: 0 };
++  if (maxImages > 0) trimExcessImages(body, maxImages, stats);
+ 
+   for (const key of ['previous_response_id', 'conversation']) {
+     if (body[key] != null) {
+diff --git a/src/server.mjs b/src/server.mjs
+index 2863303..5f0ba2c 100644
+--- a/src/server.mjs
++++ b/src/server.mjs
+@@ -293,10 +293,11 @@ export function createShimServer(options = {}) {
+       let changed = false;
+       if (route.operation && config.mode === 'strip') {
+         const decoded = await readJSON(req, config.maxBodyBytes);
+-        const sanitized = sanitizeResponsesRequest(decoded.value, { strict: config.strict });
++        const sanitized = sanitizeResponsesRequest(decoded.value, { strict: config.strict, maxImages: config.maxImages || 0 });
+         event.sanitized = sanitized.stats;
+         changed = sanitized.stats.reasoning_items_removed > 0 || sanitized.stats.item_ids_removed > 0
+-          || (sanitized.stats.nested_encrypted_blocks_removed || 0) > 0;
++          || (sanitized.stats.nested_encrypted_blocks_removed || 0) > 0
++          || (sanitized.stats.images_removed || 0) > 0;
+         bytes = changed ? Buffer.from(JSON.stringify(sanitized.body)) : decoded.raw;
+         if (bytes.length > config.maxBodyBytes) {
+           throw new ShimError(413, 'request_too_large', 'The sanitized request exceeds SHIM_MAX_BODY_BYTES.');

@@ -68,13 +68,75 @@ function removeNestedEncrypted(root) {
   return removed;
 }
 
+// image-limit extension (local patch 2026-11-13): gateways cap the number of
+// images per request (e.g. "Exceeded maximum number of images (50)"). Codex
+// replays every screenshot a long session ever produced, so trim older image
+// blocks and leave a text placeholder; tool pairings stay intact because only
+// content parts are replaced. Copy-on-write: no trim -> original input kept.
+const IMAGE_TYPES = new Set(['input_image', 'image', 'computer_screenshot']);
+const IMAGE_PLACEHOLDER = '[older image omitted to respect the upstream image limit]';
+const isImageBlock = (value) => record(value)
+  && (IMAGE_TYPES.has(value.type) || string(value.image_url))
+  && (string(value.image_url) || string(value.file_id) || string(value.image_base64));
+
+function trimExcessImages(body, maxImages, stats) {
+  if (!Array.isArray(body.input)) return;
+  // Pass 1: collect image-block references in document order (no mutation).
+  const slots = [];
+  const collect = (container) => {
+    if (!Array.isArray(container)) return;
+    for (let i = 0; i < container.length; i++) {
+      const value = container[i];
+      if (isImageBlock(value)) slots.push({ container, index: i });
+      else if (record(value)) {
+        for (const key of ['content', 'output']) collect(value[key]);
+      }
+    }
+  };
+  for (let i = 0; i < body.input.length; i++) {
+    const item = body.input[i];
+    if (isImageBlock(item)) slots.push({ container: body.input, index: i, topLevel: true });
+    else if (record(item)) for (const key of ['content', 'output']) collect(item[key]);
+  }
+  const excess = slots.length - maxImages;
+  if (excess <= 0) return;
+  // Pass 2: clone input, then replace the oldest `excess` blocks with text.
+  body.input = structuredClone(body.input);
+  const cloneSlots = [];
+  const collectClone = (container) => {
+    if (!Array.isArray(container)) return;
+    for (let i = 0; i < container.length; i++) {
+      const value = container[i];
+      if (isImageBlock(value)) cloneSlots.push({ container, index: i });
+      else if (record(value)) {
+        for (const key of ['content', 'output']) collectClone(value[key]);
+      }
+    }
+  };
+  for (let i = 0; i < body.input.length; i++) {
+    const item = body.input[i];
+    if (isImageBlock(item)) cloneSlots.push({ container: body.input, index: i, topLevel: true });
+    else if (record(item)) for (const key of ['content', 'output']) collectClone(item[key]);
+  }
+  for (const slot of cloneSlots.slice(0, excess)) {
+    if (slot.topLevel) {
+      slot.container[slot.index] = { type: 'message', role: 'user', content: [{ type: 'input_text', text: IMAGE_PLACEHOLDER }] };
+    } else {
+      slot.container[slot.index] = { type: 'input_text', text: IMAGE_PLACEHOLDER };
+    }
+  }
+  stats.images_removed = (stats.images_removed || 0) + excess;
+  stats.images_kept = maxImages;
+}
+
 /** Pure, copy-on-write sanitizer; also usable directly in an SDK transport. */
-export function sanitizeResponsesRequest(request, { strict = false } = {}) {
+export function sanitizeResponsesRequest(request, { strict = false, maxImages = 0 } = {}) {
   if (!record(request)) {
     throw new ShimError(400, 'invalid_json_object', 'The request body must be a JSON object.');
   }
   const body = { ...request };
   const stats = { reasoning_items_removed: 0, item_ids_removed: 0, opaque_state_items: 0 };
+  if (maxImages > 0) trimExcessImages(body, maxImages, stats);
 
   for (const key of ['previous_response_id', 'conversation']) {
     if (body[key] != null) {

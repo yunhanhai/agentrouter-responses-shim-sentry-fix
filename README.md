@@ -15,6 +15,7 @@
 |---|---|
 | `sentry-fix-v1` | 递归清理嵌套 `encrypted_content`,修复 `invalid_encrypted_content` → `response.failed` 流中断 |
 | `cursor-retry-v1` | `--retry-429` 429/5xx 自动重试(首字节前)、`--routes` 多上游前缀路由、`--proxy` 出站代理 |
+| `image-limit-v1` | `--max-images N` 只保留最新 N 张图片,更早的替换为文本占位,避免网关「超过 50 张图」400 |
 
 ---
 
@@ -126,6 +127,35 @@ agentrouter-shim --routes routes.json --retry-429 4 --retry-backoff-ms 8000 --re
 > `--proxy` 走 undici(ProxyAgent,支持 h2),需要额外安装:
 > `npm install -g undici`。不装则仅在不使用 `--proxy` 时正常工作。
 
+## 修复内容(image-limit-v1:图片数量上限)
+
+**症状**:长会话(尤其带屏幕截图 / computer-use 工具)续聊时报:
+
+```
+HTTP 400: Exceeded maximum number of images (50) allowed in the request
+```
+
+**根因**:Codex 会把历史里所有截图(工具输出中的 `{"type":"input_image",...}` 块)
+原样回放;上游网关对单次请求的图片数量有硬上限(常见 50),超限即 400。
+这属于**请求内容问题**,与密文/重试无关,shim 之前不会处理。
+
+**修复**:新增 `--max-images N`(环境变量 `SHIM_MAX_IMAGES`,默认 0 = 关闭)。
+启用后 shim 在转发前扫描 `input` 里所有图片块(含 `content[]`、`output[]` 深层嵌套),
+**只保留最新的 N 张**,更早的整块替换为
+`{"type":"input_text","text":"[older image omitted to respect the upstream image limit]"}`
+(文件名/工具输出结构不变,tool call 配对不受影响)。
+
+- 保持 copy-on-write:未超限时不复制、不修改原请求;
+- 日志中新增 `images_removed` / `images_kept` 计数与 `max_images` 启动参数,
+  便于观察是否触发裁剪;
+- 建议值:上限 50 时取 **30**,留出余量应对同一轮新增截图。
+
+重试/路由/图片限制三者可叠加,例如:
+
+```bash
+agentrouter-shim --routes routes.json --retry-429 4 --retry-backoff-ms 8000 --retry-max-wait-ms 30000 --max-images 30 --port 18080 --log-usage
+```
+
 ## 验证
 
 1. **单元验证**(`examples/demo.mjs`,无网络、无密钥):
@@ -159,22 +189,35 @@ agentrouter-shim --routes routes.json --retry-429 4 --retry-backoff-ms 8000 --re
      `{"event":"retry_429","upstream_status":429,"attempt":1,"wait_ms":8000,...}`,
      退避序列 8s → 16s → 30s → 30s。
 
+5. **图片上限验证**(image-limit-v1):
+
+   - 单元验证:`node examples/image-limit.mjs`(60 张图 → 保留最新 30 张,10 项检查全过);
+   - 端到端:假上游收到 60 张图的请求 → shim 裁剪后上游实收 30 张 → `200`
+     (`{"event":"listening",...,"max_images":30}`);
+   - 生产对照:未打补丁时上游返回
+     `400 {"code":null,"message":"Exceeded maximum number of images (50) allowed in the request"}`;
+     打补丁并启用 `--max-images 30` 后同类型长会话恢复正常。
+
 ## 目录结构
 
 ```
 ├── patches/
 │   ├── sentry-fix-v1.patch     # 相对 npm 2.0.1 原版的标准 unified diff
-│   └── cursor-retry-v1.patch   # 在 sentry-fix-v1 之上叠加(429 重试/路由/代理)
+│   ├── cursor-retry-v1.patch   # 在 sentry-fix-v1 之上叠加(429 重试/路由/代理)
+│   └── image-limit-v1.patch    # 在 cursor-retry-v1 之上叠加(图片数量上限)
 ├── src-patched/
 │   ├── sanitize.mjs            # 打好补丁的完整文件(可直接覆盖)
 │   ├── server.mjs              # 打好补丁的完整文件(可直接覆盖)
 │   ├── retry-cli.mjs           # cursor-retry:CLI 参数解析
 │   └── retry-routing.mjs       # cursor-retry:路由 / 重试 / 代理实现
+├── bin-patched/
+│   └── agentrouter-shim.mjs    # bin 入口(把 maxImages 并入 config)
 ├── scripts/
 │   ├── apply.ps1               # Windows:自动定位全局包、备份、覆盖、重启
 │   └── restore.ps1             # 回滚到补丁前
 ├── examples/
-│   └── demo.mjs                # 单元验证脚本(node examples/demo.mjs)
+│   ├── demo.mjs                # sentry-fix 单元验证
+│   └── image-limit.mjs         # image-limit 单元验证
 └── LICENSE                     # MIT(来自原包,Copyright (c) 2026 stevenarai)
 ```
 
@@ -204,6 +247,12 @@ pwsh -File .\scripts\apply.ps1
 $(npm root -g)/agentrouter-responses-shim/src/
 ```
 
+把 `bin-patched/agentrouter-shim.mjs` 复制到:
+
+```
+$(npm root -g)/agentrouter-responses-shim/bin/
+```
+
 然后重启 shim。
 
 ### 方式 C:git apply
@@ -212,6 +261,7 @@ $(npm root -g)/agentrouter-responses-shim/src/
 cd "$(npm root -g)/agentrouter-responses-shim"
 git apply /path/to/patches/sentry-fix-v1.patch
 git apply /path/to/patches/cursor-retry-v1.patch   # 可选:429 重试/路由/代理
+git apply /path/to/patches/image-limit-v1.patch    # 可选:--max-images 图片上限
 ```
 
 ### 验证补丁生效
@@ -238,6 +288,9 @@ pwsh -File .\scripts\restore.ps1
   总重试时长还受客户端首字节超时约束(例如 cc-switch 默认 120s),
   `--retry-429`/退避参数需按实际超时预算调整。
 - `--proxy` 依赖 undici(`npm install -g undici`),未安装时不要使用该参数。
+- `--max-images` 会**丢弃最早若干张图片的实际内容**(替换为占位文本),模型因此
+  看不到这些旧截图;这是规避网关图片数量上限的取舍,建议只裁剪到略低于上限的值。
+  该裁剪对所有包含图片的请求生效(包括非 computer-use 场景的多图对话)。
 
 ## 复现上游问题的最小步骤(用于给上游提 issue)
 

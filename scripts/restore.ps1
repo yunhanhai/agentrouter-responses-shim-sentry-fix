@@ -14,15 +14,24 @@ foreach ($file in @('sanitize.mjs', 'server.mjs', 'retry-cli.mjs', 'retry-routin
   $backup = Join-Path $srcDir "$file.orig-2.0.1"
   if (Test-Path $backup) {
     Copy-Item $backup $target -Force
-    Write-Host "[sentry-fix-v1] restored: $file"
+    Write-Host "[patch] restored: $file"
     $restored++
   } elseif (Test-Path $target) {
     Remove-Item $target -Force
-    Write-Host "[sentry-fix-v1] removed file added by patch: $file"
+    Write-Host "[patch] removed file added by patch: $file"
     $restored++
   } else {
-    Write-Host "[sentry-fix-v1] nothing to restore for $file"
+    Write-Host "[patch] nothing to restore for $file"
   }
+}
+
+$binTarget = Join-Path (Join-Path (Split-Path -Parent $srcDir) 'bin') 'agentrouter-shim.mjs'
+if (Test-Path "$binTarget.orig-2.0.1") {
+  Copy-Item "$binTarget.orig-2.0.1" $binTarget -Force
+  Write-Host '[patch] restored: bin/agentrouter-shim.mjs'
+  $restored++
+} else {
+  Write-Host '[patch] nothing to restore for bin/agentrouter-shim.mjs'
 }
 
 if ($restored -gt 0) {
@@ -30,9 +39,10 @@ if ($restored -gt 0) {
   if ($listener) {
     $proc = Get-Process -Id $listener.OwningProcess -ErrorAction SilentlyContinue
     if ($proc -and $proc.ProcessName -eq 'node') {
-      Write-Host "[sentry-fix-v1] restarting shim (pid $($proc.Id))..."
+      Write-Host "[patch] restarting shim (pid $($proc.Id))..."
       Stop-Process -Id $proc.Id -Force
     }
   }
-  Write-Host '[sentry-fix-v1] done. Original files restored.'
+  Write-Host '[patch] done. Original files restored.'
 }
+
