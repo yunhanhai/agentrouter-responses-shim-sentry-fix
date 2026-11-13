@@ -148,12 +148,12 @@ HTTP 400: Exceeded maximum number of images (50) allowed in the request
 - 保持 copy-on-write:未超限时不复制、不修改原请求;
 - 日志中新增 `images_removed` / `images_kept` 计数与 `max_images` 启动参数,
   便于观察是否触发裁剪;
-- 建议值:上限 50 时取 **30**,留出余量应对同一轮新增截图。
+- 建议值:上限 50 时取 **45**(留 5 张余量;我们统计的是图片块总数,是上游计数的超集,45 一定 ≤ 50)。若上游随后新增其他图片形态导致仍超限,可下调到 30。
 
 重试/路由/图片限制三者可叠加,例如:
 
 ```bash
-agentrouter-shim --routes routes.json --retry-429 4 --retry-backoff-ms 8000 --retry-max-wait-ms 30000 --max-images 30 --port 18080 --log-usage
+agentrouter-shim --routes routes.json --retry-429 4 --retry-backoff-ms 8000 --retry-max-wait-ms 30000 --max-images 45 --port 18080 --log-usage
 ```
 
 ## 验证
@@ -193,10 +193,10 @@ agentrouter-shim --routes routes.json --retry-429 4 --retry-backoff-ms 8000 --re
 
    - 单元验证:`node examples/image-limit.mjs`(60 张图 → 保留最新 30 张,10 项检查全过);
    - 端到端:假上游收到 60 张图的请求 → shim 裁剪后上游实收 30 张 → `200`
-     (`{"event":"listening",...,"max_images":30}`);
+     (`{"event":"listening",...,"max_images":45}`);
    - 生产对照:未打补丁时上游返回
      `400 {"code":null,"message":"Exceeded maximum number of images (50) allowed in the request"}`;
-     打补丁并启用 `--max-images 30` 后同类型长会话恢复正常。
+     打补丁并启用 `--max-images 45` 后同类型长会话恢复正常(60 张进 → 上游实收 45 张 → 200)。
 
 ## 目录结构
 
@@ -214,7 +214,8 @@ agentrouter-shim --routes routes.json --retry-429 4 --retry-backoff-ms 8000 --re
 │   └── agentrouter-shim.mjs    # bin 入口(把 maxImages 并入 config)
 ├── scripts/
 │   ├── apply.ps1               # Windows:自动定位全局包、备份、覆盖、重启
-│   └── restore.ps1             # 回滚到补丁前
+│   ├── restore.ps1             # 回滚到补丁前
+│   └── supervise-shim.mjs      # 守护进程模板:崩溃自动拉起(推荐配合开机自启)
 ├── examples/
 │   ├── demo.mjs                # sentry-fix 单元验证
 │   └── image-limit.mjs         # image-limit 单元验证
@@ -310,3 +311,4 @@ pwsh -File .\scripts\restore.ps1
 
 [MIT](LICENSE) © 2026 stevenarai(原包);
 本仓库修改部分同样以 MIT 发布。
+
