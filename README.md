@@ -101,23 +101,49 @@ HTTP 层面是 `200`，失败发生在流内部，所以客户端只能看到「
 
 | 参数 | 说明 |
 |---|---|
-| `--retry-429 N` | 遇到 **429/502/503/504** 时，在**首字节写出前**自动重试，最多 N 次（默认 0 = 关闭） |
+| `--retry-429 N` | 遇到可重试状态码时，在**首字节写出前**自动重试，最多 N 次（默认 0 = 关闭） |
+| `--retry-statuses LIST` | 可重试状态码，逗号分隔或区间，默认 `429,502,503,504`；例如 `404,429,502-504` |
+| `--retry-stream` | 额外重试「HTTP 200 但首帧就是瞬时失败」的流（如 `Concurrency limit exceeded`） |
+| `--retry-stream-hold-ms N` | 等待首个内容事件的上限，默认 6000 |
 | `--retry-backoff-ms N` | 首次退避毫秒数，每次翻倍，默认 30000 |
 | `--retry-max-wait-ms N` | 退避上限，默认 180000 |
 | `--routes FILE` | 前缀路由文件，一个 shim 进程服务多个上游（多 provider 模式） |
 | `--proxy URL` | 出站 HTTP(S) 代理（CONNECT 隧道），可按路由单独配置 |
 
-对应环境变量：`SHIM_RETRY_429`、`SHIM_RETRY_BACKOFF_MS`、`SHIM_RETRY_MAX_WAIT_MS`、
+对应环境变量：`SHIM_RETRY_429`、`SHIM_RETRY_STATUSES`、`SHIM_RETRY_STREAM`、
+`SHIM_RETRY_STREAM_HOLD_MS`、`SHIM_RETRY_BACKOFF_MS`、`SHIM_RETRY_MAX_WAIT_MS`、
 `SHIM_ROUTES_FILE`、`SHIM_PROXY`。
 
 ### 重试行为
 
-- 只重试 **429 / 502 / 503 / 504**，且必须发生在**第一个响应字节之前**
+- 只重试 `--retry-statuses` 列出的状态码，且必须发生在**第一个响应字节之前**
   （Azure/OpenAI 的限流在请求入口直接返回 429，正是这个窗口）；
 - 退避为指数翻倍（8s → 16s → 32s → …），受 `--retry-max-wait-ms` 封顶；
 - 若上游返回 `Retry-After` 头（秒数或 HTTP 日期），**优先按它等待**；
 - 每次重试记录一条 `retry_429` 日志事件（含 attempt / 等待时长 / 上游地址）；
 - 客户端首字节超时（如 cc-switch 默认 120s）会限制总重试窗口，参数需与之匹配。
+
+### 流内错误重试（`--retry-stream`）
+
+有些网关不返回 HTTP 错误，而是先给 `200`，再在 SSE 里吐一条失败事件，例如：
+
+```
+event: response.failed
+data: {"type":"response.failed","response":{"status":"failed",
+  "error":{"message":"Concurrency limit exceeded for account, please retry later"}}}
+```
+
+客户端只会看到 `stream disconnected before completion`。开启 `--retry-stream` 后：
+
+- shim **暂不把响应头写给客户端**，先缓冲，直到出现第一个「内容事件」
+  （`output_text.delta` / `output_item.added` / `completed` 等）；
+- 若在此之前出现**瞬时**错误（并发限制 / 限流 / 过载 / `retry later`），丢弃本次响应并重试；
+- 若出现的是**永久性**错误（无效 key、客户端不被允许、参数错误），**不重试**，原样透传；
+- 为避免慢首 token 被误判成卡死，最多只压 `--retry-stream-hold-ms`（默认 6s），
+  超时即放行已缓冲内容。
+
+重试日志为 `{"event":"retry_stream","attempt":1,"reason":"transient_stream_error",...}`。
+只识别 SSE 行首的规范事件标记，普通正文里出现 "event: error" 字样不会被误判。
 
 ### 多上游路由示例
 
@@ -273,7 +299,8 @@ git apply /path/to/patches/image-limit-v1.patch    # 可选：图片数量上限
 ├── patches/
 │   ├── sentry-fix-v1.patch     # 相对 npm 2.0.1 原版的标准 unified diff
 │   ├── cursor-retry-v1.patch   # 在 sentry-fix-v1 之上叠加（429 重试/路由/代理）
-│   └── image-limit-v1.patch    # 在 cursor-retry-v1 之上叠加（图片数量上限）
+│   ├── image-limit-v1.patch    # 在 cursor-retry-v1 之上叠加（图片数量上限）
+│   └── retry-stream-v1.patch   # 在 image-limit-v1 之上叠加（可配置状态码 + 流内错误重试）
 ├── src-patched/
 │   ├── sanitize.mjs            # 打好补丁的完整文件（可直接覆盖）
 │   ├── server.mjs              # 打好补丁的完整文件（可直接覆盖）
@@ -307,6 +334,9 @@ pwsh -File .\scripts\restore.ps1
   建议移植逻辑而不是整文件覆盖）。
 - 本补丁针对 `agentrouter-responses-shim@2.0.1` 编写并验证；其他版本需自行核对。
 - 429 重试只在**流式响应首字节之前**有效；流已经开始后无法重试（协议限制）。
+  `--retry-stream` 把窗口前移到「首个内容事件之前」，但一旦有内容写出，同样无法回退。
+- 流内重试会短暂压住响应头（默认最多 6s）。若上游首 token 很慢，
+  客户端在这段时间内看不到 `response.created`，属预期行为。
   总重试时长还受客户端首字节超时约束（例如 cc-switch 默认 120s），
   `--retry-429` / 退避参数需按实际超时预算调整。
 - `--proxy` 依赖 undici（`npm install -g undici`），未安装时不要使用该参数。

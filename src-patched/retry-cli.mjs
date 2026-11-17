@@ -9,7 +9,13 @@ export { RETRY_OPTIONS };
 export const EXTRA_HELP = `
 Cursor-retry patch options (all optional, default off):
 
-  --retry-429 N        Retry 429/502/503/504 before first upstream byte (default 0 = off)
+  --retry-429 N        Retry retryable statuses before first upstream byte (default 0 = off)
+  --retry-statuses S   Comma list / range of retryable statuses (default 429,502,503,504;
+                       e.g. "404,429,502-504")
+  --retry-stream       Also retry a 200 stream whose *first* events are a transient
+                       upstream failure (e.g. "Concurrency limit exceeded")
+  --retry-stream-hold-ms N  Max time to hold the response head while waiting for the
+                       first content event (default 6000)
   --retry-backoff-ms N Initial backoff, doubles per attempt (default 30000)
   --retry-max-wait-ms N Backoff ceiling (default 180000)
   --max-images N       Keep only the newest N image blocks in replayed history,

@@ -1,0 +1,342 @@
+diff --git a/src-patched/retry-cli.mjs b/src-patched/retry-cli.mjs
+index 631df30..d3c70fc 100644
+--- a/src-patched/retry-cli.mjs
++++ b/src-patched/retry-cli.mjs
+@@ -9,7 +9,13 @@ export { RETRY_OPTIONS };
+ export const EXTRA_HELP = `
+ Cursor-retry patch options (all optional, default off):
+ 
+-  --retry-429 N        Retry 429/502/503/504 before first upstream byte (default 0 = off)
++  --retry-429 N        Retry retryable statuses before first upstream byte (default 0 = off)
++  --retry-statuses S   Comma list / range of retryable statuses (default 429,502,503,504;
++                       e.g. "404,429,502-504")
++  --retry-stream       Also retry a 200 stream whose *first* events are a transient
++                       upstream failure (e.g. "Concurrency limit exceeded")
++  --retry-stream-hold-ms N  Max time to hold the response head while waiting for the
++                       first content event (default 6000)
+   --retry-backoff-ms N Initial backoff, doubles per attempt (default 30000)
+   --retry-max-wait-ms N Backoff ceiling (default 180000)
+   --max-images N       Keep only the newest N image blocks in replayed history,
+diff --git a/src-patched/retry-routing.mjs b/src-patched/retry-routing.mjs
+index e3fa60f..64ef1d8 100644
+--- a/src-patched/retry-routing.mjs
++++ b/src-patched/retry-routing.mjs
+@@ -24,6 +24,9 @@ export const RETRY_OPTIONS = {
+   'retry-429': { type: 'string' },
+   'retry-backoff-ms': { type: 'string' },
+   'retry-max-wait-ms': { type: 'string' },
++  'retry-statuses': { type: 'string' },
++  'retry-stream': { type: 'boolean' },
++  'retry-stream-hold-ms': { type: 'string' },
+   'max-images': { type: 'string' },
+   routes: { type: 'string' },
+   proxy: { type: 'string' },
+@@ -33,6 +36,9 @@ export const RETRY_ENV = {
+   retry429: { env: 'SHIM_RETRY_429', fallback: 0 },
+   retryBackoffMs: { env: 'SHIM_RETRY_BACKOFF_MS', fallback: 30000 },
+   retryMaxWaitMs: { env: 'SHIM_RETRY_MAX_WAIT_MS', fallback: 180000 },
++  retryStatuses: { env: 'SHIM_RETRY_STATUSES', fallback: '429,502,503,504' },
++  retryStream: { env: 'SHIM_RETRY_STREAM', fallback: '' },
++  retryStreamHoldMs: { env: 'SHIM_RETRY_STREAM_HOLD_MS', fallback: 6000 },
+   maxImages: { env: 'SHIM_MAX_IMAGES', fallback: 0 },
+   routesFile: { env: 'SHIM_ROUTES_FILE', fallback: '' },
+   proxyUrl: { env: 'SHIM_PROXY', fallback: '' },
+@@ -49,6 +55,14 @@ export function configFromOverrides(env = process.env, overrides = {}) {
+   const retry429 = integer2(pick('retry-429', RETRY_ENV.retry429), 0, 'retry-429', 50);
+   const retryBackoffMs = integer2(pick('retry-backoff-ms', RETRY_ENV.retryBackoffMs), 30000, 'retry-backoff-ms', 600000);
+   const retryMaxWaitMs = integer2(pick('retry-max-wait-ms', RETRY_ENV.retryMaxWaitMs), 180000, 'retry-max-wait-ms', 3600000);
++  // stream-error retry: an upstream may answer 200 + SSE `response.failed`
++  // (e.g. "Concurrency limit exceeded"). Buffering until the first content
++  // event lets the shim retry without the client ever seeing the failure.
++  const retryStatuses = statusList(pick('retry-statuses', RETRY_ENV.retryStatuses));
++  const retryStream = booleanish(pick('retry-stream', RETRY_ENV.retryStream));
++  // Upper bound on how long the head may be held waiting for the first content
++  // event. Prevents a slow first token from looking like a hung request.
++  const retryStreamHoldMs = integer2(pick('retry-stream-hold-ms', RETRY_ENV.retryStreamHoldMs), 6000, 'retry-stream-hold-ms', 60000);
+   // image-limit extension: keep only the newest N images in replayed history.
+   // Gateways commonly cap images per request (e.g. 50); 0 disables the trim.
+   const maxImages = integer2(pick('max-images', RETRY_ENV.maxImages), 0, 'max-images', 1000);
+@@ -56,7 +70,36 @@ export function configFromOverrides(env = process.env, overrides = {}) {
+   const proxyUrl = String(pick('proxy', RETRY_ENV.proxyUrl) || '');
+   const routes = routesFile ? loadRoutes(routesFile) : null;
+   if (proxyUrl) proxyURL(proxyUrl); // validate early
+-  return { retry429, retryBackoffMs, retryMaxWaitMs, maxImages, routes, routesFile, proxyUrl };
++  return { retry429, retryBackoffMs, retryMaxWaitMs, retryStatuses, retryStream, retryStreamHoldMs, maxImages, routes, routesFile, proxyUrl };
++}
++
++/** "429,404,5xx" -> [429,404,500,501,...]; unknown tokens are ignored, order preserved. */
++function statusList(value) {
++  const raw = String(value ?? '').trim();
++  if (!raw) return [429, 502, 503, 504];
++  const out = [];
++  for (const token of raw.split(',')) {
++    const t = token.trim().toLowerCase();
++    if (!t) continue;
++    const range = t.match(/^(\d{3})-(\d{3})$/);
++    if (range) {
++      const from = Number(range[1]);
++      const to = Number(range[2]);
++      if (!(from >= 100 && to <= 599 && from <= to)) throw new Error(`--retry-statuses: bad range ${t}`);
++      for (let s = from; s <= to; s++) if (!out.includes(s)) out.push(s);
++      continue;
++    }
++    const code = Number(t);
++    if (!Number.isInteger(code) || code < 100 || code > 599) throw new Error(`--retry-statuses: bad status ${t}`);
++    if (!out.includes(code)) out.push(code);
++  }
++  return out.length ? out : [429, 502, 503, 504];
++}
++
++function booleanish(value) {
++  if (value === true) return true;
++  const raw = String(value ?? '').trim().toLowerCase();
++  return raw === '1' || raw === 'true' || raw === 'yes' || raw === 'on';
+ }
+ 
+ function integer2(value, fallback, name, maximum) {
+@@ -266,6 +309,10 @@ export function forwardWithRetry(ctx) {
+   const maxAttempts = 1 + Math.max(0, retry.retry429);
+   const backoffBase = retry.retryBackoffMs;
+   const maxWait = retry.retryMaxWaitMs;
++  const retryStatuses = new Set(retry.retryStatuses && retry.retryStatuses.length
++    ? retry.retryStatuses : [429, 502, 503, 504]);
++  const retryStream = Boolean(retry.retryStream);
++  const streamHoldMs = Number.isFinite(retry.retryStreamHoldMs) ? retry.retryStreamHoldMs : 6000;
+ 
+   // Merge per-route proxy over global proxy.
+   const proxyUrl = route?.proxy?.href || retry.proxyUrl || '';
+@@ -349,7 +396,7 @@ export function forwardWithRetry(ctx) {
+           const status = response.statusCode;
+ 
+           // ── Retry decision: only BEFORE the first forwarded byte ──
+-          const retryableStatus = status === 429 || status === 502 || status === 503 || status === 504;
++          const retryableStatus = retryStatuses.has(status);
+           if (retryableStatus && attempt < maxAttempts) {
+             const waitMs = waitTimeFor(response, attempt);
+             // Drain the (likely tiny) error body so the socket can be reused/destroyed cleanly.
+@@ -363,25 +410,127 @@ export function forwardWithRetry(ctx) {
+             return;
+           }
+ 
+-          // ── Success or non-retryable: forward verbatim (original behavior) ──
+-          settled = true;
+-          cleanupFns.splice(0).forEach((fn) => { try { fn(); } catch {} });
+-          // Re-register the original close/error handlers for stream lifetime.
+-          const responseHeaders = ctx.copyHeaders(response.headers);
+-          if (String(responseHeaders['content-type']).includes('text/event-stream')) responseHeaders['x-accel-buffering'] = 'no';
+-          res.writeHead(status, responseHeaders);
+-          res.flushHeaders();
+-          response.once('error', (error) => {
+-            onError('upstream_stream_error');
+-            if (!res.destroyed && !res.writableEnded) res.destroy();
+-            else if (res.destroyed) { /* client gone */ }
+-          });
+-          if (config.logUsage) {
+-            const observer = ctx.createUsageObserver(response.headers);
+-            response.on('data', (chunk) => observer.push(chunk));
+-            response.once('end', () => onMetrics(observer.finish()));
+-          }
+-          response.pipe(res);
++          const isSSE = String(response.headers['content-type'] || '').includes('text/event-stream');
++          // Stream-error retry: hold the head until the first *content* event.
++          // An upstream may answer 200 and only then emit response.failed
++          // (e.g. "Concurrency limit exceeded"); buffering costs no perceived
++          // latency because the client renders nothing before the first delta.
++          const canHoldHead = retryStream && isSSE && attempt < maxAttempts
++            && status >= 200 && status < 300;
++
++          const writeHead = () => {
++            const responseHeaders = ctx.copyHeaders(response.headers);
++            if (isSSE) responseHeaders['x-accel-buffering'] = 'no';
++            res.writeHead(status, responseHeaders);
++            res.flushHeaders();
++          };
++
++          const passThrough = () => {
++            settled = true;
++            cleanupFns.splice(0).forEach((fn) => { try { fn(); } catch {} });
++            writeHead();
++            response.once('error', (error) => {
++              onError('upstream_stream_error');
++              if (!res.destroyed && !res.writableEnded) res.destroy();
++              else if (res.destroyed) { /* client gone */ }
++            });
++            if (config.logUsage) {
++              const observer = ctx.createUsageObserver(response.headers);
++              response.on('data', (chunk) => observer.push(chunk));
++              response.once('end', () => onMetrics(observer.finish()));
++            }
++            response.pipe(res);
++          };
++
++          if (!canHoldHead) { passThrough(); return; }
++
++          // Buffer until the first content-bearing event, the cap, or the hold budget.
++          const MAX_HOLD = 64 * 1024;
++          const held = [];
++          let heldBytes = 0;
++          let heldText = '';
++          let decided = false;
++          let holdTimer = null;
++
++          const stopHold = () => {
++            if (holdTimer) { clearTimeout(holdTimer); holdTimer = null; }
++          };
++
++          const retryFromStream = (reason) => {
++            decided = true;
++            stopHold();
++            cleanupFns.splice(0).forEach((fn) => { try { fn(); } catch {} });
++            try { bodyStream.removeListener('data', onHeldData); bodyStream.on('error', () => {}); } catch {}
++            response.destroy();
++            const waitMs = waitTime(attempt);
++            log({
++              event: 'retry_stream', attempt, max_attempts: maxAttempts,
++              wait_ms: waitMs, reason,
++              upstream: `${target.protocol}//${target.host}${target.pathname}`,
++            });
++            setTimeout(tryOnce, waitMs);
++          };
++
++          const flushHeld = () => {
++            if (process.env.SHIM_DEBUG_HOLD === '1') process.stderr.write(`[hold] flush decided=${decided} bytes=${heldBytes}\n`);
++            if (decided) return;
++            decided = true;
++            stopHold();
++            settled = true;
++            cleanupFns.splice(0).forEach((fn) => { try { fn(); } catch {} });
++            bodyStream.removeListener('data', onHeldData);
++            bodyStream.removeListener('end', onHeldEnd);
++            bodyStream.removeListener('error', onHeldError);
++            writeHead();
++            for (const chunk of held) res.write(chunk);
++            response.once('error', (error) => {
++              onError('upstream_stream_error');
++              if (!res.destroyed && !res.writableEnded) res.destroy();
++            });
++            if (config.logUsage) {
++              const observer = ctx.createUsageObserver(response.headers);
++              for (const chunk of held) observer.push(chunk);
++              response.on('data', (chunk) => observer.push(chunk));
++              response.once('end', () => onMetrics(observer.finish()));
++            }
++            response.pipe(res);
++          };
++
++          const onHeldData = (chunk) => {
++            if (process.env.SHIM_DEBUG_HOLD === '1') process.stderr.write(`[hold] data ${chunk.length}B\n`);
++            held.push(chunk);
++            heldBytes += chunk.length;
++            heldText += chunk.toString('utf8');
++            if (heldText.length > MAX_HOLD * 2) heldText = heldText.slice(-MAX_HOLD * 2);
++            const verdict = classifyStreamText(heldText);
++            if (verdict === 'transient-error') {
++              if (process.env.SHIM_DEBUG_HOLD === '1') process.stderr.write('[hold] matched transient, head=' + JSON.stringify(heldText.slice(0, 260)) + '\n');
++              retryFromStream('transient_stream_error'); return;
++            }
++            if (verdict === 'content' || heldBytes >= MAX_HOLD) flushHeld();
++          };
++
++          const onHeldEnd = () => {
++            if (decided) return;
++            const verdict = classifyStreamText(heldText);
++            if (verdict === 'transient-error') { retryFromStream('transient_stream_error'); return; }
++            if (!heldBytes) { retryFromStream('empty_stream'); return; }
++            flushHeld();
++          };
++
++          const onHeldError = () => {
++            if (decided) return;
++            retryFromStream('upstream_stream_error');
++          };
++
++          const bodyStream = response.body || response;
++          bodyStream.on('data', onHeldData);
++          bodyStream.once('end', onHeldEnd);
++          bodyStream.on('error', onHeldError);
++          // Never hold longer than the budget: a slow first token must not look
++          // like a hung request to the client.
++          if (process.env.SHIM_DEBUG_HOLD === '1') process.stderr.write(`[hold] timer ${streamHoldMs}ms\n`);
++          holdTimer = setTimeout(() => { holdTimer = null; flushHeld(); }, streamHoldMs);
+         });
+ 
+         outgoing.end(body);
+@@ -420,6 +569,57 @@ export function forwardWithRetry(ctx) {
+   void gaveUp;
+ }
+ 
++// ── Stream classification (for pre-content retry) ───────────────────────────
++
++// Anchored at an SSE line start so normal payload text (e.g. a user message
++// containing the words "event: error") cannot be mistaken for a real event.
++const CONTENT_PATTERN = /"type"\s*:\s*"response\.(?:output_text\.delta|output_item\.(?:added|done)|content_part\.added|function_call_arguments\.delta|reasoning_text\.delta|reasoning_summary_text\.delta|completed|incomplete)"/i;
++
++const ERROR_PATTERNS = [
++  /(?:^|\n)event:\s*error\b/i,
++  /(?:^|\n)data:\s*\{[^\n]*"type"\s*:\s*"response\.failed"/i,
++  /(?:^|\n)data:\s*\{[^\n]*"object"\s*:\s*"error"/i,
++  /(?:^|\n)data:\s*\{[^\n]*"type"\s*:\s*"error"/i,
++];
++
++// Only transient upstream failures are worth another attempt; a permanent
++// rejection (bad key, client not allowed, bad request) must reach the client.
++const TRANSIENT_PATTERN = new RegExp([
++  'concurrency limit', 'rate limit', 'rate_limit', 'too many requests',
++  'overloaded', 'over capacity', 'capacity', 'temporarily unavailable',
++  'try again later', 'retry later', 'please retry', 'server busy',
++].join('|'), 'i');
++
++function firstPatternIndex(text, patterns) {
++  let best = -1;
++  let hit = null;
++  for (const pattern of patterns) {
++    const match = pattern.exec(text);
++    if (match && (best === -1 || match.index < best)) { best = match.index; hit = pattern; }
++  }
++  return { index: best, pattern: hit };
++}
++
++/**
++ * Look at the buffered prefix of an SSE stream and decide whether the shim
++ * should keep waiting for content, give up and retry, or start forwarding.
++ * @returns {'content'|'transient-error'|'error'|null}
++ */
++export function classifyStreamText(text) {
++  if (!text) return null;
++  const error = firstPatternIndex(text, ERROR_PATTERNS);
++  const contentAt = text.search(CONTENT_PATTERN);
++  if (process.env.SHIM_DEBUG_HOLD === '1' && error.index !== -1) {
++    process.stderr.write('[hold] error_pattern=' + error.pattern + ' at ' + error.index
++      + ' ctx=' + JSON.stringify(text.slice(Math.max(0, error.index - 60), error.index + 60)) + '\n');
++  }
++  if (error.index !== -1 && (contentAt === -1 || error.index < contentAt)) {
++    return TRANSIENT_PATTERN.test(text) ? 'transient-error' : 'error';
++  }
++  if (contentAt !== -1) return 'content';
++  return null;
++}
++
+ function buildHeaders(req, body, changed, bearer, config, target) {
+   // Replicates forward()'s header logic from server.mjs (kept in sync manually).
+   const headers = { ...req.headers };
+diff --git a/src-patched/server.mjs b/src-patched/server.mjs
+index 5f0ba2c..0ce589c 100644
+--- a/src-patched/server.mjs
++++ b/src-patched/server.mjs
+@@ -321,7 +321,15 @@ export function createShimServer(options = {}) {
+           } : null,
+           routeFixed: { path: route.path, search: route.search },
+           body: bytes, changed, bearer, config, base,
+-          retry: { retry429: retry.retry429, retryBackoffMs: retry.retryBackoffMs, retryMaxWaitMs: retry.retryMaxWaitMs, proxyUrl: retry.proxyUrl },
++          retry: {
++            retry429: retry.retry429,
++            retryBackoffMs: retry.retryBackoffMs,
++            retryMaxWaitMs: retry.retryMaxWaitMs,
++            retryStatuses: retry.retryStatuses,
++            retryStream: retry.retryStream,
++            retryStreamHoldMs: retry.retryStreamHoldMs,
++            proxyUrl: retry.proxyUrl,
++          },
+           onError: (code) => { event.error_code = code; },
+           onMetrics: (metrics) => { Object.assign(event, metrics); },
+           sendError,
