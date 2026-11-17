@@ -118,6 +118,11 @@ HTTP 层面是 `200`，失败发生在流内部，所以客户端只能看到「
 
 - 只重试 `--retry-statuses` 列出的状态码，且必须发生在**第一个响应字节之前**
   （Azure/OpenAI 的限流在请求入口直接返回 429，正是这个窗口）；
+- **瞬时传输错误同样重试**：`ENOTFOUND`、`EAI_AGAIN`、`ECONNRESET`、`ECONNREFUSED`、
+  `ETIMEDOUT` 等（中继域名轮换时 DNS 会短暂掉线，此前会立刻 502）；
+  日志事件为 `retry_connect`，重试次数与退避同上；
+- 建议的生产值：`--retry-statuses 404,429,502,503,504,520-527,530`
+  （404：网关偶发误报；52x/530：Cloudflare 源站瞬断）；配合 `--retry-stream` 使用；
 - 退避为指数翻倍（8s → 16s → 32s → …），受 `--retry-max-wait-ms` 封顶；
 - 若上游返回 `Retry-After` 头（秒数或 HTTP 日期），**优先按它等待**；
 - 每次重试记录一条 `retry_429` 日志事件（含 attempt / 等待时长 / 上游地址）；
@@ -242,8 +247,10 @@ $(npm root -g)/agentrouter-responses-shim/bin/
 ```bash
 cd "$(npm root -g)/agentrouter-responses-shim"
 git apply /path/to/patches/sentry-fix-v1.patch
-git apply /path/to/patches/cursor-retry-v1.patch   # 可选：429 重试/路由/代理
+git apply /path/to/patches/cursor-retry-v1.patch   # 可选：重试/路由/代理
 git apply /path/to/patches/image-limit-v1.patch    # 可选：图片数量上限
+git apply /path/to/patches/retry-stream-v1.patch   # 可选：可配置状态码 + 流内错误重试
+git apply /path/to/patches/retry-fixes-v1.patch    # 可选：传输错误重试 + CLI 参数透传修复
 ```
 
 ### 验证补丁生效
@@ -284,6 +291,15 @@ git apply /path/to/patches/image-limit-v1.patch    # 可选：图片数量上限
      `{"event":"retry_429","upstream_status":429,"attempt":1,"wait_ms":8000,...}`，
      退避序列 8s → 16s → 30s → 30s。
 
+5. **传输错误与 CLI 参数验证**(retry-fixes-v1):
+
+   - `--retry-statuses` / `--retry-stream` / `--retry-stream-hold-ms` 三个 CLI 参数
+     在 retry-stream-v1 中未并入 `overrides`，导致命令行开启无效（仅环境变量有效）；
+     本补丁补上透传，并新增瞬时传输错误重试（日志事件 `retry_connect`）；
+   - 实测 5/5：上游 404×2 → 200、并发限制 SSE 帧×2 → 200（客户端只见成功流）、
+     连接重置×2 → 200、403 立即透传（不重试）、DNS `ENOTFOUND` 重试 3 次后 502；
+   - 生产对照:`api666.zzzcoding.org` DNS 掉线期间日志出现 4 条 `retry_connect`，之后返回 502。
+
 5. **图片上限验证**（image-limit-v1）：
 
    - 单元验证：`node examples/image-limit.mjs`（60 张图 → 保留最新 30 张，10 项检查全过）；
@@ -300,7 +316,8 @@ git apply /path/to/patches/image-limit-v1.patch    # 可选：图片数量上限
 │   ├── sentry-fix-v1.patch     # 相对 npm 2.0.1 原版的标准 unified diff
 │   ├── cursor-retry-v1.patch   # 在 sentry-fix-v1 之上叠加（429 重试/路由/代理）
 │   ├── image-limit-v1.patch    # 在 cursor-retry-v1 之上叠加（图片数量上限）
-│   └── retry-stream-v1.patch   # 在 image-limit-v1 之上叠加（可配置状态码 + 流内错误重试）
+│   ├── retry-stream-v1.patch   # 在 image-limit-v1 之上叠加（可配置状态码 + 流内错误重试）
+│   └── retry-fixes-v1.patch    # 在 retry-stream-v1 之上叠加（传输错误重试 + CLI 参数透传修复）
 ├── src-patched/
 │   ├── sanitize.mjs            # 打好补丁的完整文件（可直接覆盖）
 │   ├── server.mjs              # 打好补丁的完整文件（可直接覆盖）

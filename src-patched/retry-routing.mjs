@@ -44,6 +44,13 @@ export const RETRY_ENV = {
   proxyUrl: { env: 'SHIM_PROXY', fallback: '' },
 };
 
+// Transient transport failures retried before any client byte is written:
+// relay domains rotate and their DNS occasionally drops for seconds.
+export const RETRYABLE_TRANSPORT = new Set([
+  'ENOTFOUND', 'EAI_AGAIN', 'ECONNRESET', 'ECONNREFUSED', 'ETIMEDOUT',
+  'EPIPE', 'EHOSTUNREACH', 'ENETUNREACH', 'ERR_SOCKET_CONNECTION_TIMEOUT',
+]);
+
 /** Parse + validate the retry/routing/proxy options. Returns null-safe defaults when disabled. */
 export function configFromOverrides(env = process.env, overrides = {}) {
   const pick = (key, mapping) => {
@@ -344,6 +351,21 @@ export function forwardWithRetry(ctx) {
 
     const fail = (error, code) => {
       if (settled) return;
+      // Transport-level transient failures (DNS blips, socket resets, timeouts)
+      // are retried the same way as retryable statuses while no client byte
+      // has been written yet. A client-fingerprint rejection (401/403) never
+      // reaches this branch with a retryable code and stays terminal.
+      if (attempt < maxAttempts && RETRYABLE_TRANSPORT.has(error?.code) && !res.headersSent) {
+        settled = true;
+        cleanupFns.forEach((fn) => { try { fn(); } catch {} });
+        log({
+          event: 'retry_connect', code: error.code, attempt,
+          max_attempts: maxAttempts, wait_ms: waitTime(attempt),
+          error: String(error?.message || error),
+        });
+        setTimeout(tryOnce, waitTime(attempt));
+        return;
+      }
       settled = true;
       cleanupFns.forEach((fn) => { try { fn(); } catch {} });
       onError(code || 'upstream_connection_error');
