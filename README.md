@@ -121,6 +121,12 @@ HTTP 层面是 `200`，失败发生在流内部，所以客户端只能看到「
 - **瞬时传输错误同样重试**：`ENOTFOUND`、`EAI_AGAIN`、`ECONNRESET`、`ECONNREFUSED`、
   `ETIMEDOUT` 等（中继域名轮换时 DNS 会短暂掉线，此前会立刻 502）；
   日志事件为 `retry_connect`，重试次数与退避同上；
+- **401/403 也按响应体判断**：若错误信息属于网关的瞬时判定
+  （`This account only allows Codex official clients`、`unauthorized client detected` 等），
+  同样重试（日志事件 `retry_auth`）；真正的鉴权失败（`invalid api key` 等）立即透传；
+- **上游超时归类为 `ETIMEDOUT` 并可重试**：此前超时直接 502，现在按退避重试；
+  建议 `--timeout 60000`，并把 cc-switch 的 `streaming_first_byte_timeout` 提到 240s
+  （慢速/排队网关需要更长的首字节预算，否则重试窗口会被客户端先掐断）；
 - 建议的生产值：`--retry-statuses 404,429,502,503,504,520-527,530`
   （404：网关偶发误报；52x/530：Cloudflare 源站瞬断）；配合 `--retry-stream` 使用；
 - 退避为指数翻倍（8s → 16s → 32s → …），受 `--retry-max-wait-ms` 封顶；
@@ -251,6 +257,7 @@ git apply /path/to/patches/cursor-retry-v1.patch   # 可选：重试/路由/代�
 git apply /path/to/patches/image-limit-v1.patch    # 可选：图片数量上限
 git apply /path/to/patches/retry-stream-v1.patch   # 可选：可配置状态码 + 流内错误重试
 git apply /path/to/patches/retry-fixes-v1.patch    # 可选：传输错误重试 + CLI 参数透传修复
+git apply /path/to/patches/retry-fixes-v2.patch    # 可选：401/403 瞬时判定重试 + 超时归类
 ```
 
 ### 验证补丁生效
@@ -300,7 +307,14 @@ git apply /path/to/patches/retry-fixes-v1.patch    # 可选：传输错误重试
      连接重置×2 → 200、403 立即透传（不重试）、DNS `ENOTFOUND` 重试 3 次后 502；
    - 生产对照:`api666.zzzcoding.org` DNS 掉线期间日志出现 4 条 `retry_connect`，之后返回 502。
 
-5. **图片上限验证**（image-limit-v1）：
+6. **401/403 瞬时判定验证**（retry-fixes-v2）：
+
+   - 上游连续 2 次返回 `403 This account only allows Codex official clients` → 重试 2 次后 `200`；
+   - 上游返回 `403 invalid api key` → **不重试**，立即透传（真鉴权失败不能被掩盖）；
+   - 生产对照：`api666.zzzcoding.org` 缺少 `x-codex-*` 头时返回 403；
+     带完整 Codex Desktop 头时正常 200（网关按请求头识别"官方客户端"）。
+
+7. **图片上限验证**（image-limit-v1）：
 
    - 单元验证：`node examples/image-limit.mjs`（60 张图 → 保留最新 30 张，10 项检查全过）；
    - 端到端：假上游收到 60 张图的请求 → shim 裁剪后上游实收 30 张 → `200`
@@ -317,7 +331,8 @@ git apply /path/to/patches/retry-fixes-v1.patch    # 可选：传输错误重试
 │   ├── cursor-retry-v1.patch   # 在 sentry-fix-v1 之上叠加（429 重试/路由/代理）
 │   ├── image-limit-v1.patch    # 在 cursor-retry-v1 之上叠加（图片数量上限）
 │   ├── retry-stream-v1.patch   # 在 image-limit-v1 之上叠加（可配置状态码 + 流内错误重试）
-│   └── retry-fixes-v1.patch    # 在 retry-stream-v1 之上叠加（传输错误重试 + CLI 参数透传修复）
+│   ├── retry-fixes-v1.patch    # 在 retry-stream-v1 之上叠加（传输错误重试 + CLI 参数透传修复）
+│   └── retry-fixes-v2.patch    # 在 retry-fixes-v1 之上叠加（401/403 瞬时判定重试 + 超时归类）
 ├── src-patched/
 │   ├── sanitize.mjs            # 打好补丁的完整文件（可直接覆盖）
 │   ├── server.mjs              # 打好补丁的完整文件（可直接覆盖）

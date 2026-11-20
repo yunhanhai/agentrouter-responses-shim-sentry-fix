@@ -355,7 +355,9 @@ export function forwardWithRetry(ctx) {
       // are retried the same way as retryable statuses while no client byte
       // has been written yet. A client-fingerprint rejection (401/403) never
       // reaches this branch with a retryable code and stays terminal.
-      if (attempt < maxAttempts && RETRYABLE_TRANSPORT.has(error?.code) && !res.headersSent) {
+      const transportCode = error?.code
+        || (String(error?.message || '').includes('upstream timeout') ? 'ETIMEDOUT' : undefined);
+      if (attempt < maxAttempts && RETRYABLE_TRANSPORT.has(transportCode) && !res.headersSent) {
         settled = true;
         cleanupFns.forEach((fn) => { try { fn(); } catch {} });
         log({
@@ -393,7 +395,7 @@ export function forwardWithRetry(ctx) {
         }
         if (rawSocket) cleanupFns.push(() => { try { rawSocket.destroy(); } catch {} });
 
-        const timeout = () => outgoing.destroy(new Error('upstream timeout'));
+        const timeout = () => { const e = new Error('upstream timeout'); e.code = 'ETIMEDOUT'; outgoing.destroy(e); };
         const headerTimer = setTimeout(timeout, config.timeoutMs);
         headerTimer.unref();
         outgoing.setTimeout(config.timeoutMs, timeout);
@@ -433,6 +435,58 @@ export function forwardWithRetry(ctx) {
           }
 
           const isSSE = String(response.headers['content-type'] || '').includes('text/event-stream');
+
+          // Auth-shaped statuses (401/403) are usually terminal, but pooled
+          // relays flip them per request for the *same* key ("This account only
+          // allows Codex official clients", "unauthorized client detected").
+          // Sniff a small prefix and retry only when the body matches a
+          // transient pattern; genuine auth failures pass through untouched.
+          if ((status === 401 || status === 403) && attempt < maxAttempts) {
+            const chunks = [];
+            let size = 0;
+            let decided = false;
+            const finish = (retry) => {
+              if (decided) return;
+              decided = true;
+              response.off('data', onData);
+              const text = Buffer.concat(chunks).toString('utf8');
+              if (retry && TRANSIENT_PATTERN.test(text)) {
+                response.resume();
+                const waitMs = waitTimeFor(response, attempt);
+                log({
+                  event: 'retry_auth', upstream_status: status, attempt,
+                  max_attempts: maxAttempts, wait_ms: waitMs,
+                  upstream: `${target.protocol}//${target.host}${target.pathname}`,
+                });
+                const schedule = () => setTimeout(tryOnce, waitMs);
+                if (response.readableEnded) schedule();
+                else response.once('end', schedule);
+                return;
+              }
+              settled = true;
+              cleanupFns.splice(0).forEach((fn) => { try { fn(); } catch {} });
+              const responseHeaders = ctx.copyHeaders(response.headers);
+              if (isSSE) responseHeaders['x-accel-buffering'] = 'no';
+              res.writeHead(status, responseHeaders);
+              res.flushHeaders();
+              for (const chunk of chunks) res.write(chunk);
+              chunks.length = 0;
+              if (response.readableEnded) { res.end(); return; }
+              response.pipe(res);
+            };
+            const onData = (chunk) => {
+              if (decided) return;
+              chunks.push(chunk);
+              size += chunk.length;
+              if (size >= 8192) finish(true);
+            };
+            response.on('data', onData);
+            response.once('end', () => finish(true));
+            const sniffTimer = setTimeout(() => finish(true), 1500);
+            sniffTimer.unref();
+            return;
+          }
+
           // Stream-error retry: hold the head until the first *content* event.
           // An upstream may answer 200 and only then emit response.failed
           // (e.g. "Concurrency limit exceeded"); buffering costs no perceived
@@ -610,6 +664,9 @@ const TRANSIENT_PATTERN = new RegExp([
   'concurrency limit', 'rate limit', 'rate_limit', 'too many requests',
   'overloaded', 'over capacity', 'capacity', 'temporarily unavailable',
   'try again later', 'retry later', 'please retry', 'server busy',
+  // Gateway-side client heuristics that flip per request on the same key
+  // (observed on pooled relays: 403 "official clients" interleaved with 429).
+  'official clients', 'unauthorized client', 'client detected',
 ].join('|'), 'i');
 
 function firstPatternIndex(text, patterns) {
@@ -666,3 +723,5 @@ function buildHeaders(req, body, changed, bearer, config, target) {
   }
   return headers;
 }
+
+
