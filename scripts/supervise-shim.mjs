@@ -7,13 +7,13 @@ const LOG = 'C:\\Users\\zhenmao\\.agentrouter-shim\\shim.log';
 const PORT = 18080;
 const ARGS = [
   '--routes', 'C:\\Users\\zhenmao\\.agentrouter-shim\\routes.json',
-  '--retry-429', '2',
-  '--retry-backoff-ms', '5000',
-  '--retry-max-wait-ms', '10000',
+  '--retry-429', '3',
+  '--retry-backoff-ms', '20000',
+  '--retry-max-wait-ms', '60000',
   '--retry-statuses', '404,429,502,503,504,520-527,530',
   '--retry-stream',
   '--retry-stream-hold-ms', '3000',
-  '--timeout', '60000',
+  '--timeout', '45000',
   '--max-images', '45',
   '--port', String(PORT),
   '--log-usage',
@@ -60,4 +60,5 @@ async function main() {
 }
 
 main();
+
 

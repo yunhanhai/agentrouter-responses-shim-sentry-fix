@@ -125,8 +125,12 @@ HTTP 层面是 `200`，失败发生在流内部，所以客户端只能看到「
   （`This account only allows Codex official clients`、`unauthorized client detected` 等），
   同样重试（日志事件 `retry_auth`）；真正的鉴权失败（`invalid api key` 等）立即透传；
 - **上游超时归类为 `ETIMEDOUT` 并可重试**：此前超时直接 502，现在按退避重试；
-  建议 `--timeout 60000`，并把 cc-switch 的 `streaming_first_byte_timeout` 提到 240s
-  （慢速/排队网关需要更长的首字节预算，否则重试窗口会被客户端先掐断）；
+- **组级限流（`group requests-per-minute limit exceeded`）要按"分钟"退避**：
+  5s/10s 这类短退避跨不过限流窗口，还会额外消耗配额。推荐生产值：
+  `--retry-429 3 --retry-backoff-ms 20000 --retry-max-wait-ms 60000 --timeout 45000`
+  （等待 20s → 40s → 60s），并把 cc-switch 的 `streaming_first_byte_timeout` 提到 **300s**，
+  否则总重试时长会被客户端首字节超时先掐断；
+- 实测：一次真实请求经历 `429 → 20s → 503 → 40s → 200`（总 72s），客户端全程无感；
 - 建议的生产值：`--retry-statuses 404,429,502,503,504,520-527,530`
   （404：网关偶发误报；52x/530：Cloudflare 源站瞬断）；配合 `--retry-stream` 使用；
 - 退避为指数翻倍（8s → 16s → 32s → …），受 `--retry-max-wait-ms` 封顶；
