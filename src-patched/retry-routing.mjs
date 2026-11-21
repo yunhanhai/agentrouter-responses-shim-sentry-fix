@@ -27,6 +27,7 @@ export const RETRY_OPTIONS = {
   'retry-statuses': { type: 'string' },
   'retry-stream': { type: 'boolean' },
   'retry-stream-hold-ms': { type: 'string' },
+  'stream-idle-timeout-ms': { type: 'string' },
   'max-images': { type: 'string' },
   routes: { type: 'string' },
   proxy: { type: 'string' },
@@ -39,6 +40,7 @@ export const RETRY_ENV = {
   retryStatuses: { env: 'SHIM_RETRY_STATUSES', fallback: '429,502,503,504' },
   retryStream: { env: 'SHIM_RETRY_STREAM', fallback: '' },
   retryStreamHoldMs: { env: 'SHIM_RETRY_STREAM_HOLD_MS', fallback: 6000 },
+  streamIdleTimeoutMs: { env: 'SHIM_STREAM_IDLE_TIMEOUT_MS', fallback: 600000 },
   maxImages: { env: 'SHIM_MAX_IMAGES', fallback: 0 },
   routesFile: { env: 'SHIM_ROUTES_FILE', fallback: '' },
   proxyUrl: { env: 'SHIM_PROXY', fallback: '' },
@@ -70,6 +72,9 @@ export function configFromOverrides(env = process.env, overrides = {}) {
   // Upper bound on how long the head may be held waiting for the first content
   // event. Prevents a slow first token from looking like a hung request.
   const retryStreamHoldMs = integer2(pick('retry-stream-hold-ms', RETRY_ENV.retryStreamHoldMs), 6000, 'retry-stream-hold-ms', 60000);
+  // Idle budget for an already-open SSE stream: reasoning models can stay
+  // silent for minutes; a short socket timeout here truncates the client body.
+  const streamIdleTimeoutMs = integer2(pick('stream-idle-timeout-ms', RETRY_ENV.streamIdleTimeoutMs), 600000, 'stream-idle-timeout-ms', 3600000);
   // image-limit extension: keep only the newest N images in replayed history.
   // Gateways commonly cap images per request (e.g. 50); 0 disables the trim.
   const maxImages = integer2(pick('max-images', RETRY_ENV.maxImages), 0, 'max-images', 1000);
@@ -77,7 +82,7 @@ export function configFromOverrides(env = process.env, overrides = {}) {
   const proxyUrl = String(pick('proxy', RETRY_ENV.proxyUrl) || '');
   const routes = routesFile ? loadRoutes(routesFile) : null;
   if (proxyUrl) proxyURL(proxyUrl); // validate early
-  return { retry429, retryBackoffMs, retryMaxWaitMs, retryStatuses, retryStream, retryStreamHoldMs, maxImages, routes, routesFile, proxyUrl };
+  return { retry429, retryBackoffMs, retryMaxWaitMs, retryStatuses, retryStream, retryStreamHoldMs, streamIdleTimeoutMs, maxImages, routes, routesFile, proxyUrl };
 }
 
 /** "429,404,5xx" -> [429,404,500,501,...]; unknown tokens are ignored, order preserved. */
@@ -296,6 +301,17 @@ export function createUpstreamRequest(target, options, headers, onRequestReady) 
   }).catch((error) => onRequestReady(error, null, null));
 }
 
+// Emits a protocol-valid SSE error frame when the client head is already out:
+// destroying the socket mid-chunk surfaces as "error decoding response body"
+// on the client, while a terminated event stream is readable.
+function writeSseError(res, message) {
+  try {
+    res.write(`event: error\ndata: ${JSON.stringify({ type: 'error', error: { type: 'upstream_error', message: String(message || 'upstream error') } })}\n\n`);
+    res.end();
+  } catch {
+    try { res.destroy(); } catch { /* ignore */ }
+  }
+}
 // ── Forward with retry (pre-first-byte only) ────────────────────────────────
 
 /**
@@ -320,6 +336,7 @@ export function forwardWithRetry(ctx) {
     ? retry.retryStatuses : [429, 502, 503, 504]);
   const retryStream = Boolean(retry.retryStream);
   const streamHoldMs = Number.isFinite(retry.retryStreamHoldMs) ? retry.retryStreamHoldMs : 6000;
+  const streamIdleMs = Number.isFinite(retry.streamIdleTimeoutMs) ? retry.streamIdleTimeoutMs : 600000;
 
   // Merge per-route proxy over global proxy.
   const proxyUrl = route?.proxy?.href || retry.proxyUrl || '';
@@ -372,8 +389,13 @@ export function forwardWithRetry(ctx) {
       cleanupFns.forEach((fn) => { try { fn(); } catch {} });
       onError(code || 'upstream_connection_error');
       if (res.destroyed || res.writableEnded) return;
-      if (res.headersSent) res.destroy();
-      else {
+      if (res.headersSent) {
+        if (String(res.getHeader('content-type') || '').includes('text/event-stream')) {
+          writeSseError(res, (error && error.message) || code || 'upstream error');
+        } else res.destroy();
+        return;
+      }
+      {
         const e = error instanceof Error ? error : new Error(String(error));
         e.status = e.status || 502;
         e.code = e.code || code || 'upstream_connection_error';
@@ -413,6 +435,8 @@ export function forwardWithRetry(ctx) {
         outgoing.once('response', (response) => {
           incoming = response;
           clearTimeout(headerTimer);
+          // Headers arrived: idle gaps inside the stream use the long budget.
+          outgoing.setTimeout(streamIdleMs, timeout);
 
           // Client already gone? Nothing to retry.
           if (res.destroyed) { response.destroy(); return; }
@@ -507,8 +531,13 @@ export function forwardWithRetry(ctx) {
             writeHead();
             response.once('error', (error) => {
               onError('upstream_stream_error');
-              if (!res.destroyed && !res.writableEnded) res.destroy();
-              else if (res.destroyed) { /* client gone */ }
+              // Terminate the client stream cleanly with an SSE error frame:
+              // destroying res mid-chunk yields "error decoding response body"
+              // in the client instead of a readable error event.
+              if (!res.destroyed && !res.writableEnded) {
+                if (isSSE && res.headersSent) writeSseError(res, String(error?.message || 'upstream stream error'));
+                else res.destroy();
+              }
             });
             if (config.logUsage) {
               const observer = ctx.createUsageObserver(response.headers);
@@ -561,7 +590,10 @@ export function forwardWithRetry(ctx) {
             for (const chunk of held) res.write(chunk);
             response.once('error', (error) => {
               onError('upstream_stream_error');
-              if (!res.destroyed && !res.writableEnded) res.destroy();
+              if (!res.destroyed && !res.writableEnded) {
+                if (isSSE && res.headersSent) writeSseError(res, String(error?.message || 'upstream stream error'));
+                else res.destroy();
+              }
             });
             if (config.logUsage) {
               const observer = ctx.createUsageObserver(response.headers);
@@ -723,5 +755,9 @@ function buildHeaders(req, body, changed, bearer, config, target) {
   }
   return headers;
 }
+
+
+
+
 
 

@@ -328,6 +328,7 @@ export function createShimServer(options = {}) {
             retryStatuses: retry.retryStatuses,
             retryStream: retry.retryStream,
             retryStreamHoldMs: retry.retryStreamHoldMs,
+            streamIdleTimeoutMs: retry.streamIdleTimeoutMs,
             proxyUrl: retry.proxyUrl,
           },
           onError: (code) => { event.error_code = code; },
@@ -356,4 +357,5 @@ export function createShimServer(options = {}) {
   });
   return server;
 }
+
 

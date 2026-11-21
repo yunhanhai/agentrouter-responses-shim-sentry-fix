@@ -131,6 +131,13 @@ HTTP 层面是 `200`，失败发生在流内部，所以客户端只能看到「
   （等待 20s → 40s → 60s），并把 cc-switch 的 `streaming_first_byte_timeout` 提到 **300s**，
   否则总重试时长会被客户端首字节超时先掐断；
 - 实测：一次真实请求经历 `429 → 20s → 503 → 40s → 200`（总 72s），客户端全程无感；
+- **流式响应有独立的空闲预算**（`--stream-idle-timeout-ms`，默认 600000）：
+  推理模型常在首令牌前静默数十秒，若沿用较短的 `--timeout` 会被误杀，
+  客户端看到的就是 `stream disconnected ... error decoding response body`；
+  本补丁在收到响应头后把 socket 空闲超时切换到该长预算；
+- **上游中途断流时用 SSE 错误帧收尾**，而不是直接 destroy 连接：
+  截断的 chunked 流会让客户端报 `error decoding response body`，
+  干净收尾后客户端读到的是标准 `event: error`，可正常重试且不会误判为网络故障；
 - 建议的生产值：`--retry-statuses 404,429,502,503,504,520-527,530`
   （404：网关偶发误报；52x/530：Cloudflare 源站瞬断）；配合 `--retry-stream` 使用；
 - 退避为指数翻倍（8s → 16s → 32s → …），受 `--retry-max-wait-ms` 封顶；
@@ -262,6 +269,7 @@ git apply /path/to/patches/image-limit-v1.patch    # 可选：图片数量上限
 git apply /path/to/patches/retry-stream-v1.patch   # 可选：可配置状态码 + 流内错误重试
 git apply /path/to/patches/retry-fixes-v1.patch    # 可选：传输错误重试 + CLI 参数透传修复
 git apply /path/to/patches/retry-fixes-v2.patch    # 可选：401/403 瞬时判定重试 + 超时归类
+git apply /path/to/patches/retry-fixes-v3.patch    # 可选：流空闲预算 + 中途断流干净收尾
 ```
 
 ### 验证补丁生效
@@ -318,7 +326,17 @@ git apply /path/to/patches/retry-fixes-v2.patch    # 可选：401/403 瞬时判�
    - 生产对照：`api666.zzzcoding.org` 缺少 `x-codex-*` 头时返回 403；
      带完整 Codex Desktop 头时正常 200（网关按请求头识别"官方客户端"）。
 
-7. **图片上限验证**（image-limit-v1）：
+7. **流空闲与断流收尾验证**（retry-fixes-v3，2/2 通过）：
+
+   - 上游发送 `response.created` 后静默 6 秒再输出：`--timeout 2s` +
+     `--stream-idle-timeout-ms 15s` 时**不被误杀**，客户端完整收到后续事件；
+   - 上游中途销毁 socket：客户端收到完整流（含 `event: error` 帧），
+     不再出现 chunked 截断导致的 `error decoding response body`；
+   - 生产对照：`chatflowsai` 曾出现 24 条 `completed=false`（其中 8 条
+     `upstream_stream_error`），即 45s 空闲预算误杀长推理流；
+     修复后同链路请求 `completed=true`（30.6s，84KB SSE 完整返回）。
+
+8. **图片上限验证**（image-limit-v1）：
 
    - 单元验证：`node examples/image-limit.mjs`（60 张图 → 保留最新 30 张，10 项检查全过）；
    - 端到端：假上游收到 60 张图的请求 → shim 裁剪后上游实收 30 张 → `200`
@@ -336,7 +354,8 @@ git apply /path/to/patches/retry-fixes-v2.patch    # 可选：401/403 瞬时判�
 │   ├── image-limit-v1.patch    # 在 cursor-retry-v1 之上叠加（图片数量上限）
 │   ├── retry-stream-v1.patch   # 在 image-limit-v1 之上叠加（可配置状态码 + 流内错误重试）
 │   ├── retry-fixes-v1.patch    # 在 retry-stream-v1 之上叠加（传输错误重试 + CLI 参数透传修复）
-│   └── retry-fixes-v2.patch    # 在 retry-fixes-v1 之上叠加（401/403 瞬时判定重试 + 超时归类）
+│   ├── retry-fixes-v2.patch    # 在 retry-fixes-v1 之上叠加（401/403 瞬时判定重试 + 超时归类）
+│   └── retry-fixes-v3.patch    # 在 retry-fixes-v2 之上叠加（流空闲预算 + 中途断流干净收尾）
 ├── src-patched/
 │   ├── sanitize.mjs            # 打好补丁的完整文件（可直接覆盖）
 │   ├── server.mjs              # 打好补丁的完整文件（可直接覆盖）
