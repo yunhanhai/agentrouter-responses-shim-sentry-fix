@@ -1,0 +1,123 @@
+diff --git a/bin/agentrouter-shim.mjs b/bin/agentrouter-shim.mjs
+index f23e017..b188cf5 100644
+--- a/bin/agentrouter-shim.mjs
++++ b/bin/agentrouter-shim.mjs
+@@ -51,6 +51,7 @@ try {
+       config.retry = retry;
+       config.routes = routes;
+       config.maxImages = retry.maxImages;
++      config.ensurePromptCacheKey = retry.ensurePromptCacheKey;
+     }
+     const server = createShimServer(config);
+     server.once('error', (error) => { log({ event: 'startup_error', code: error.code || 'listen_failed' }); process.exitCode = 1; });
+@@ -71,3 +72,4 @@ try {
+   log({ event: 'configuration_error', message: error.message });
+   process.exitCode = 1;
+ }
++
+diff --git a/src/retry-cli.mjs b/src/retry-cli.mjs
+index ed055b0..466e00a 100644
+--- a/src/retry-cli.mjs
++++ b/src/retry-cli.mjs
+@@ -47,6 +47,7 @@ export function applyRetryOptions(env, parsedValues, baseConfig) {
+     'retry-stream': parsedValues['retry-stream'],
+     'retry-stream-hold-ms': parsedValues['retry-stream-hold-ms'],
+     'stream-idle-timeout-ms': parsedValues['stream-idle-timeout-ms'],
++    'ensure-prompt-cache-key': parsedValues['ensure-prompt-cache-key'],
+     'max-images': parsedValues['max-images'],
+     routes: parsedValues.routes,
+     proxy: parsedValues.proxy,
+@@ -54,4 +55,5 @@ export function applyRetryOptions(env, parsedValues, baseConfig) {
+   const retry = configFromOverrides(env, overrides);
+   return { config: baseConfig, retry, routes: retry.routes };
+ }
+-
++
++
+diff --git a/src/retry-routing.mjs b/src/retry-routing.mjs
+index d86c5be..6e2717d 100644
+--- a/src/retry-routing.mjs
++++ b/src/retry-routing.mjs
+@@ -28,6 +28,7 @@ export const RETRY_OPTIONS = {
+   'retry-stream': { type: 'boolean' },
+   'retry-stream-hold-ms': { type: 'string' },
+   'stream-idle-timeout-ms': { type: 'string' },
++  'ensure-prompt-cache-key': { type: 'boolean' },
+   'max-images': { type: 'string' },
+   routes: { type: 'string' },
+   proxy: { type: 'string' },
+@@ -41,6 +42,7 @@ export const RETRY_ENV = {
+   retryStream: { env: 'SHIM_RETRY_STREAM', fallback: '' },
+   retryStreamHoldMs: { env: 'SHIM_RETRY_STREAM_HOLD_MS', fallback: 6000 },
+   streamIdleTimeoutMs: { env: 'SHIM_STREAM_IDLE_TIMEOUT_MS', fallback: 600000 },
++  ensurePromptCacheKey: { env: 'SHIM_ENSURE_PROMPT_CACHE_KEY', fallback: '' },
+   maxImages: { env: 'SHIM_MAX_IMAGES', fallback: 0 },
+   routesFile: { env: 'SHIM_ROUTES_FILE', fallback: '' },
+   proxyUrl: { env: 'SHIM_PROXY', fallback: '' },
+@@ -75,6 +77,8 @@ export function configFromOverrides(env = process.env, overrides = {}) {
+   // Idle budget for an already-open SSE stream: reasoning models can stay
+   // silent for minutes; a short socket timeout here truncates the client body.
+   const streamIdleTimeoutMs = integer2(pick('stream-idle-timeout-ms', RETRY_ENV.streamIdleTimeoutMs), 600000, 'stream-idle-timeout-ms', 3600000);
++  // Some relays reject /responses without prompt_cache_key; opt-in injection.
++  const ensurePromptCacheKey = booleanish(pick('ensure-prompt-cache-key', RETRY_ENV.ensurePromptCacheKey));
+   // image-limit extension: keep only the newest N images in replayed history.
+   // Gateways commonly cap images per request (e.g. 50); 0 disables the trim.
+   const maxImages = integer2(pick('max-images', RETRY_ENV.maxImages), 0, 'max-images', 1000);
+@@ -82,7 +86,7 @@ export function configFromOverrides(env = process.env, overrides = {}) {
+   const proxyUrl = String(pick('proxy', RETRY_ENV.proxyUrl) || '');
+   const routes = routesFile ? loadRoutes(routesFile) : null;
+   if (proxyUrl) proxyURL(proxyUrl); // validate early
+-  return { retry429, retryBackoffMs, retryMaxWaitMs, retryStatuses, retryStream, retryStreamHoldMs, streamIdleTimeoutMs, maxImages, routes, routesFile, proxyUrl };
++  return { retry429, retryBackoffMs, retryMaxWaitMs, retryStatuses, retryStream, retryStreamHoldMs, streamIdleTimeoutMs, ensurePromptCacheKey, maxImages, routes, routesFile, proxyUrl };
+ }
+ 
+ /** "429,404,5xx" -> [429,404,500,501,...]; unknown tokens are ignored, order preserved. */
+@@ -755,9 +759,10 @@ function buildHeaders(req, body, changed, bearer, config, target) {
+   }
+   return headers;
+ }
+-
+-
+-
+-
+-
+-
++
++
++
++
++
++
++
+diff --git a/src/server.mjs b/src/server.mjs
+index 21cfa79..6ece491 100644
+--- a/src/server.mjs
++++ b/src/server.mjs
+@@ -293,9 +293,19 @@ export function createShimServer(options = {}) {
+       let changed = false;
+       if (route.operation && config.mode === 'strip') {
+         const decoded = await readJSON(req, config.maxBodyBytes);
++        // Some relays (e.g. anyrouter) reject /responses without prompt_cache_key.
++        // Codex normally sends it; fill it from the thread headers when missing.
++        let injectedCacheKey = false;
++        if (config.ensurePromptCacheKey && decoded.value && typeof decoded.value === 'object'
++          && !Array.isArray(decoded.value) && decoded.value.prompt_cache_key == null) {
++          decoded.value.prompt_cache_key = req.headers['session-id'] || req.headers['thread-id'] || randomUUID();
++          injectedCacheKey = true;
++          event.prompt_cache_key_injected = true;
++        }
+         const sanitized = sanitizeResponsesRequest(decoded.value, { strict: config.strict, maxImages: config.maxImages || 0 });
+         event.sanitized = sanitized.stats;
+-        changed = sanitized.stats.reasoning_items_removed > 0 || sanitized.stats.item_ids_removed > 0
++        changed = injectedCacheKey
++          || sanitized.stats.reasoning_items_removed > 0 || sanitized.stats.item_ids_removed > 0
+           || (sanitized.stats.nested_encrypted_blocks_removed || 0) > 0
+           || (sanitized.stats.images_removed || 0) > 0;
+         bytes = changed ? Buffer.from(JSON.stringify(sanitized.body)) : decoded.raw;
+@@ -358,4 +368,5 @@ export function createShimServer(options = {}) {
+   return server;
+ }
+ 
+-
++
++

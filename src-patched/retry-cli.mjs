@@ -47,6 +47,7 @@ export function applyRetryOptions(env, parsedValues, baseConfig) {
     'retry-stream': parsedValues['retry-stream'],
     'retry-stream-hold-ms': parsedValues['retry-stream-hold-ms'],
     'stream-idle-timeout-ms': parsedValues['stream-idle-timeout-ms'],
+    'ensure-prompt-cache-key': parsedValues['ensure-prompt-cache-key'],
     'max-images': parsedValues['max-images'],
     routes: parsedValues.routes,
     proxy: parsedValues.proxy,
@@ -54,4 +55,5 @@ export function applyRetryOptions(env, parsedValues, baseConfig) {
   const retry = configFromOverrides(env, overrides);
   return { config: baseConfig, retry, routes: retry.routes };
 }
+
 

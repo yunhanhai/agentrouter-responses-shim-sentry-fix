@@ -145,6 +145,23 @@ HTTP 层面是 `200`，失败发生在流内部，所以客户端只能看到「
 - 每次重试记录一条 `retry_429` 日志事件（含 attempt / 等待时长 / 上游地址）；
 - 客户端首字节超时（如 cc-switch 默认 120s）会限制总重试窗口，参数需与之匹配。
 
+### 网关强制字段补全（`--ensure-prompt-cache-key`）
+
+部分中继网关的 `/v1/responses` **强制要求 `prompt_cache_key`**，缺失时直接返回
+
+```
+400 {"error":{"message":"prompt_cache_key is required","type":"new_api_error",
+     "code":"invalid_responses_request"}}
+```
+
+（实测：anyrouter.top 即如此）。Codex 通常会带这个字段，但某些请求/客户端会漏。
+开启该开关后，shim 在转发前检查请求体，缺失时用 `session-id` / `thread-id`
+请求头（或随机 UUID）补上，并在日志里标记 `prompt_cache_key_injected: true`。
+
+> 该网关同时存在 TLS 握手被重置的情况（`unexpected EOF during handshake`），
+> 可在 `routes.json` 里为该前缀单独挂代理：
+> `{ "any": { "upstream": "https://anyrouter.top/v1", "proxy": "http://127.0.0.1:10808" } }`
+
 ### 流内错误重试（`--retry-stream`）
 
 有些网关不返回 HTTP 错误，而是先给 `200`，再在 SSE 里吐一条失败事件，例如：
@@ -270,6 +287,7 @@ git apply /path/to/patches/retry-stream-v1.patch   # 可选：可配置状态码
 git apply /path/to/patches/retry-fixes-v1.patch    # 可选：传输错误重试 + CLI 参数透传修复
 git apply /path/to/patches/retry-fixes-v2.patch    # 可选：401/403 瞬时判定重试 + 超时归类
 git apply /path/to/patches/retry-fixes-v3.patch    # 可选：流空闲预算 + 中途断流干净收尾
+git apply /path/to/patches/retry-fixes-v4.patch    # 可选：prompt_cache_key 自动补全
 ```
 
 ### 验证补丁生效
@@ -336,7 +354,13 @@ git apply /path/to/patches/retry-fixes-v3.patch    # 可选：流空闲预算 + 
      `upstream_stream_error`），即 45s 空闲预算误杀长推理流；
      修复后同链路请求 `completed=true`（30.6s，84KB SSE 完整返回）。
 
-8. **图片上限验证**（image-limit-v1）：
+8. **prompt_cache_key 补全验证**（retry-fixes-v4）：
+
+   - anyrouter.top 不带该字段 → `400 prompt_cache_key is required`；带字段 → `200`（5.6s）；
+   - 经 shim（`--ensure-prompt-cache-key` + 该前缀走代理）→ 缺字段也返回 `200`
+     （日志 `prompt_cache_key_injected: true`，3.9s）。
+
+9. **图片上限验证**（image-limit-v1）：
 
    - 单元验证：`node examples/image-limit.mjs`（60 张图 → 保留最新 30 张，10 项检查全过）；
    - 端到端：假上游收到 60 张图的请求 → shim 裁剪后上游实收 30 张 → `200`
@@ -355,7 +379,8 @@ git apply /path/to/patches/retry-fixes-v3.patch    # 可选：流空闲预算 + 
 │   ├── retry-stream-v1.patch   # 在 image-limit-v1 之上叠加（可配置状态码 + 流内错误重试）
 │   ├── retry-fixes-v1.patch    # 在 retry-stream-v1 之上叠加（传输错误重试 + CLI 参数透传修复）
 │   ├── retry-fixes-v2.patch    # 在 retry-fixes-v1 之上叠加（401/403 瞬时判定重试 + 超时归类）
-│   └── retry-fixes-v3.patch    # 在 retry-fixes-v2 之上叠加（流空闲预算 + 中途断流干净收尾）
+│   ├── retry-fixes-v3.patch    # 在 retry-fixes-v2 之上叠加（流空闲预算 + 中途断流干净收尾）
+│   └── retry-fixes-v4.patch    # 在 retry-fixes-v3 之上叠加（prompt_cache_key 自动补全）
 ├── src-patched/
 │   ├── sanitize.mjs            # 打好补丁的完整文件（可直接覆盖）
 │   ├── server.mjs              # 打好补丁的完整文件（可直接覆盖）

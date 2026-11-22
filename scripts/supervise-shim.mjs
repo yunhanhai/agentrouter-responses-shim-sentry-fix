@@ -14,6 +14,7 @@ const ARGS = [
   '--retry-stream',
   '--retry-stream-hold-ms', '3000',
   '--stream-idle-timeout-ms', '600000',
+  '--ensure-prompt-cache-key',
   '--timeout', '45000',
   '--max-images', '45',
   '--port', String(PORT),
@@ -61,6 +62,7 @@ async function main() {
 }
 
 main();
+
 
 
 

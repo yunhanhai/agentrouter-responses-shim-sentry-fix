@@ -293,9 +293,19 @@ export function createShimServer(options = {}) {
       let changed = false;
       if (route.operation && config.mode === 'strip') {
         const decoded = await readJSON(req, config.maxBodyBytes);
+        // Some relays (e.g. anyrouter) reject /responses without prompt_cache_key.
+        // Codex normally sends it; fill it from the thread headers when missing.
+        let injectedCacheKey = false;
+        if (config.ensurePromptCacheKey && decoded.value && typeof decoded.value === 'object'
+          && !Array.isArray(decoded.value) && decoded.value.prompt_cache_key == null) {
+          decoded.value.prompt_cache_key = req.headers['session-id'] || req.headers['thread-id'] || randomUUID();
+          injectedCacheKey = true;
+          event.prompt_cache_key_injected = true;
+        }
         const sanitized = sanitizeResponsesRequest(decoded.value, { strict: config.strict, maxImages: config.maxImages || 0 });
         event.sanitized = sanitized.stats;
-        changed = sanitized.stats.reasoning_items_removed > 0 || sanitized.stats.item_ids_removed > 0
+        changed = injectedCacheKey
+          || sanitized.stats.reasoning_items_removed > 0 || sanitized.stats.item_ids_removed > 0
           || (sanitized.stats.nested_encrypted_blocks_removed || 0) > 0
           || (sanitized.stats.images_removed || 0) > 0;
         bytes = changed ? Buffer.from(JSON.stringify(sanitized.body)) : decoded.raw;
@@ -357,5 +367,6 @@ export function createShimServer(options = {}) {
   });
   return server;
 }
+
 
 

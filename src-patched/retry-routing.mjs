@@ -28,6 +28,7 @@ export const RETRY_OPTIONS = {
   'retry-stream': { type: 'boolean' },
   'retry-stream-hold-ms': { type: 'string' },
   'stream-idle-timeout-ms': { type: 'string' },
+  'ensure-prompt-cache-key': { type: 'boolean' },
   'max-images': { type: 'string' },
   routes: { type: 'string' },
   proxy: { type: 'string' },
@@ -41,6 +42,7 @@ export const RETRY_ENV = {
   retryStream: { env: 'SHIM_RETRY_STREAM', fallback: '' },
   retryStreamHoldMs: { env: 'SHIM_RETRY_STREAM_HOLD_MS', fallback: 6000 },
   streamIdleTimeoutMs: { env: 'SHIM_STREAM_IDLE_TIMEOUT_MS', fallback: 600000 },
+  ensurePromptCacheKey: { env: 'SHIM_ENSURE_PROMPT_CACHE_KEY', fallback: '' },
   maxImages: { env: 'SHIM_MAX_IMAGES', fallback: 0 },
   routesFile: { env: 'SHIM_ROUTES_FILE', fallback: '' },
   proxyUrl: { env: 'SHIM_PROXY', fallback: '' },
@@ -75,6 +77,8 @@ export function configFromOverrides(env = process.env, overrides = {}) {
   // Idle budget for an already-open SSE stream: reasoning models can stay
   // silent for minutes; a short socket timeout here truncates the client body.
   const streamIdleTimeoutMs = integer2(pick('stream-idle-timeout-ms', RETRY_ENV.streamIdleTimeoutMs), 600000, 'stream-idle-timeout-ms', 3600000);
+  // Some relays reject /responses without prompt_cache_key; opt-in injection.
+  const ensurePromptCacheKey = booleanish(pick('ensure-prompt-cache-key', RETRY_ENV.ensurePromptCacheKey));
   // image-limit extension: keep only the newest N images in replayed history.
   // Gateways commonly cap images per request (e.g. 50); 0 disables the trim.
   const maxImages = integer2(pick('max-images', RETRY_ENV.maxImages), 0, 'max-images', 1000);
@@ -82,7 +86,7 @@ export function configFromOverrides(env = process.env, overrides = {}) {
   const proxyUrl = String(pick('proxy', RETRY_ENV.proxyUrl) || '');
   const routes = routesFile ? loadRoutes(routesFile) : null;
   if (proxyUrl) proxyURL(proxyUrl); // validate early
-  return { retry429, retryBackoffMs, retryMaxWaitMs, retryStatuses, retryStream, retryStreamHoldMs, streamIdleTimeoutMs, maxImages, routes, routesFile, proxyUrl };
+  return { retry429, retryBackoffMs, retryMaxWaitMs, retryStatuses, retryStream, retryStreamHoldMs, streamIdleTimeoutMs, ensurePromptCacheKey, maxImages, routes, routesFile, proxyUrl };
 }
 
 /** "429,404,5xx" -> [429,404,500,501,...]; unknown tokens are ignored, order preserved. */
@@ -755,6 +759,7 @@ function buildHeaders(req, body, changed, bearer, config, target) {
   }
   return headers;
 }
+
 
 
 

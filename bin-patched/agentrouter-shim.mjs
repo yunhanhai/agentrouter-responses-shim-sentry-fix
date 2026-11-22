@@ -51,6 +51,7 @@ try {
       config.retry = retry;
       config.routes = routes;
       config.maxImages = retry.maxImages;
+      config.ensurePromptCacheKey = retry.ensurePromptCacheKey;
     }
     const server = createShimServer(config);
     server.once('error', (error) => { log({ event: 'startup_error', code: error.code || 'listen_failed' }); process.exitCode = 1; });
@@ -71,3 +72,4 @@ try {
   log({ event: 'configuration_error', message: error.message });
   process.exitCode = 1;
 }
+
