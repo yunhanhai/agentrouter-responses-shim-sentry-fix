@@ -119,7 +119,7 @@ HTTP 层面是 `200`，失败发生在流内部，所以客户端只能看到「
 - 只重试 `--retry-statuses` 列出的状态码，且必须发生在**第一个响应字节之前**
   （Azure/OpenAI 的限流在请求入口直接返回 429，正是这个窗口）；
 - **瞬时传输错误同样重试**：`ENOTFOUND`、`EAI_AGAIN`、`ECONNRESET`、`ECONNREFUSED`、
-  `ETIMEDOUT` 等（中继域名轮换时 DNS 会短暂掉线，此前会立刻 502）；
+  `ETIMEDOUT`、`EPROTO`（TLS 握手被重置）等（中继域名轮换时 DNS 会短暂掉线，此前会立刻 502）；
   日志事件为 `retry_connect`，重试次数与退避同上；
 - **401/403 也按响应体判断**：若错误信息属于网关的瞬时判定
   （`This account only allows Codex official clients`、`unauthorized client detected` 等），
@@ -288,6 +288,7 @@ git apply /path/to/patches/retry-fixes-v1.patch    # 可选：传输错误重试
 git apply /path/to/patches/retry-fixes-v2.patch    # 可选：401/403 瞬时判定重试 + 超时归类
 git apply /path/to/patches/retry-fixes-v3.patch    # 可选：流空闲预算 + 中途断流干净收尾
 git apply /path/to/patches/retry-fixes-v4.patch    # 可选：prompt_cache_key 自动补全
+git apply /path/to/patches/retry-fixes-v5.patch    # 可选：500 容量错误 + TLS EPROTO 重试
 ```
 
 ### 验证补丁生效
@@ -380,7 +381,8 @@ git apply /path/to/patches/retry-fixes-v4.patch    # 可选：prompt_cache_key �
 │   ├── retry-fixes-v1.patch    # 在 retry-stream-v1 之上叠加（传输错误重试 + CLI 参数透传修复）
 │   ├── retry-fixes-v2.patch    # 在 retry-fixes-v1 之上叠加（401/403 瞬时判定重试 + 超时归类）
 │   ├── retry-fixes-v3.patch    # 在 retry-fixes-v2 之上叠加（流空闲预算 + 中途断流干净收尾）
-│   └── retry-fixes-v4.patch    # 在 retry-fixes-v3 之上叠加（prompt_cache_key 自动补全）
+│   ├── retry-fixes-v4.patch    # 在 retry-fixes-v3 之上叠加（prompt_cache_key 自动补全）
+│   └── retry-fixes-v5.patch    # 在 retry-fixes-v4 之上叠加（500 容量错误与 TLS EPROTO 也重试）
 ├── src-patched/
 │   ├── sanitize.mjs            # 打好补丁的完整文件（可直接覆盖）
 │   ├── server.mjs              # 打好补丁的完整文件（可直接覆盖）
@@ -441,3 +443,4 @@ pwsh -File .\scripts\restore.ps1
 
 [MIT](LICENSE) © 2026 stevenarai（原包）；
 本仓库修改部分同样以 MIT 发布。
+

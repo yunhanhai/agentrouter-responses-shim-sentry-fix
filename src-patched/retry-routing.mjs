@@ -51,7 +51,7 @@ export const RETRY_ENV = {
 // Transient transport failures retried before any client byte is written:
 // relay domains rotate and their DNS occasionally drops for seconds.
 export const RETRYABLE_TRANSPORT = new Set([
-  'ENOTFOUND', 'EAI_AGAIN', 'ECONNRESET', 'ECONNREFUSED', 'ETIMEDOUT',
+  'ENOTFOUND', 'EAI_AGAIN', 'ECONNRESET', 'ECONNREFUSED', 'ETIMEDOUT', 'EPROTO',
   'EPIPE', 'EHOSTUNREACH', 'ENETUNREACH', 'ERR_SOCKET_CONNECTION_TIMEOUT',
 ]);
 
@@ -376,8 +376,10 @@ export function forwardWithRetry(ctx) {
       // are retried the same way as retryable statuses while no client byte
       // has been written yet. A client-fingerprint rejection (401/403) never
       // reaches this branch with a retryable code and stays terminal.
+      const msg = String(error?.message || '');
       const transportCode = error?.code
-        || (String(error?.message || '').includes('upstream timeout') ? 'ETIMEDOUT' : undefined);
+        || (msg.includes('upstream timeout') ? 'ETIMEDOUT' : undefined)
+        || (/EPROTO|handshake/i.test(msg) ? 'EPROTO' : undefined);
       if (attempt < maxAttempts && RETRYABLE_TRANSPORT.has(transportCode) && !res.headersSent) {
         settled = true;
         cleanupFns.forEach((fn) => { try { fn(); } catch {} });
@@ -759,10 +761,3 @@ function buildHeaders(req, body, changed, bearer, config, target) {
   }
   return headers;
 }
-
-
-
-
-
-
-

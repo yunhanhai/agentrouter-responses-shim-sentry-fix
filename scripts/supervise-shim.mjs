@@ -10,7 +10,7 @@ const ARGS = [
   '--retry-429', '3',
   '--retry-backoff-ms', '20000',
   '--retry-max-wait-ms', '60000',
-  '--retry-statuses', '404,429,502,503,504,520-527,530',
+  '--retry-statuses', '404,429,500,502,503,504,520-527,530',
   '--retry-stream',
   '--retry-stream-hold-ms', '3000',
   '--stream-idle-timeout-ms', '600000',
@@ -62,6 +62,7 @@ async function main() {
 }
 
 main();
+
 
 
 
