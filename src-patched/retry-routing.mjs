@@ -152,10 +152,28 @@ function loadRoutes(file) {
       throw new Error(`--routes: prefix "${prefix}" upstream must be http(s).`);
     }
     const proxy = entry.proxy ? proxyURL(entry.proxy) : null;
+    // Optional active/standby: when the primary keeps failing, switch to fallback.
+    let fallback = null;
+    if (entry.fallback) {
+      const fb = typeof entry.fallback === 'string' ? { upstream: entry.fallback } : entry.fallback;
+      if (!fb.upstream) throw new Error(`--routes: prefix "${prefix}" fallback is missing "upstream".`);
+      const fbUpstream = new URL(fb.upstream);
+      if (fbUpstream.protocol !== 'https:' && fbUpstream.protocol !== 'http:') {
+        throw new Error(`--routes: prefix "${prefix}" fallback upstream must be http(s).`);
+      }
+      fbUpstream.pathname = fbUpstream.pathname.replace(/\/+$/, '');
+      fallback = { base: fbUpstream, proxy: fb.proxy ? proxyURL(fb.proxy) : null };
+    }
+    const failover = {
+      failures: Number(entry.failover?.failures) > 0 ? Number(entry.failover.failures) : 3,
+      cooldownMs: Number(entry.failover?.cooldownMs) > 0 ? Number(entry.failover.cooldownMs) : 120000,
+    };
     routes.set(`/${prefix}`, {
       prefix: `/${prefix}`,
       base: upstream, // URL, pathname already as given (trailing slash stripped below)
       proxy,
+      fallback,
+      failover,
     });
     const record = routes.get(`/${prefix}`);
     record.base.pathname = record.base.pathname.replace(/\/+$/, '');
@@ -316,6 +334,16 @@ function writeSseError(res, message) {
     try { res.destroy(); } catch { /* ignore */ }
   }
 }
+// Per-route failover state: count retryable failures; after `failures`
+// consecutive failures the primary is bypassed for `cooldownMs`, then probed
+// again (half-open). A single success resets the counter.
+const circuitState = new Map();
+function circuitFor(prefix) {
+  let state = circuitState.get(prefix);
+  if (!state) { state = { failures: 0, openUntil: 0 }; circuitState.set(prefix, state); }
+  return state;
+}
+
 // ── Forward with retry (pre-first-byte only) ────────────────────────────────
 
 /**
@@ -342,9 +370,35 @@ export function forwardWithRetry(ctx) {
   const streamHoldMs = Number.isFinite(retry.retryStreamHoldMs) ? retry.retryStreamHoldMs : 6000;
   const streamIdleMs = Number.isFinite(retry.streamIdleTimeoutMs) ? retry.streamIdleTimeoutMs : 600000;
 
-  // Merge per-route proxy over global proxy.
-  const proxyUrl = route?.proxy?.href || retry.proxyUrl || '';
-  const proxy = proxyUrl ? new URL(proxyUrl) : null;
+  // Per-attempt target selection may swap to the fallback upstream.
+  const globalProxy = retry.proxyUrl ? new URL(retry.proxyUrl) : null;
+  const circuit = route ? circuitFor(route.prefix) : null;
+  const failoverCfg = route?.failover || null;
+  let lastFailoverChoice = null;
+  let attemptUsesFallback = false;
+
+  const noteFailure = (reason) => {
+    if (!circuit || !failoverCfg) return;
+    circuit.failures += 1;
+    if (circuit.failures >= failoverCfg.failures && Date.now() >= circuit.openUntil) {
+      circuit.openUntil = Date.now() + failoverCfg.cooldownMs;
+      log({
+        event: 'failover_open', reason, failures: circuit.failures,
+        cooldown_ms: failoverCfg.cooldownMs, route: route.prefix,
+        primary: route.base.href, fallback: route.fallback ? route.fallback.base.href : null,
+      });
+    }
+  };
+  const noteSuccess = () => {
+    if (!circuit) return;
+    // A success served by the fallback says nothing about the primary's health.
+    if (attemptUsesFallback) return;
+    if (circuit.failures > 0 || circuit.openUntil > 0) {
+      circuit.failures = 0;
+      circuit.openUntil = 0;
+      log({ event: 'failover_reset', route: route.prefix });
+    }
+  };
 
   let attempt = 0;
   let gaveUp = false;
@@ -353,8 +407,29 @@ export function forwardWithRetry(ctx) {
 
   const tryOnce = () => {
     attempt += 1;
-    // Recompute target per attempt (route prefix may differ from fixed base)
-    const targetBase = route ? route.base : base;
+    // Recompute target per attempt (route prefix may differ from fixed base).
+    // While the circuit is open, requests bypass the primary and use the fallback.
+    // Cooldown expired: probe the primary again (half-open) instead of
+    // staying on the fallback forever.
+    if (circuit && failoverCfg && circuit.openUntil > 0 && Date.now() >= circuit.openUntil) {
+      circuit.openUntil = 0;
+      circuit.failures = Math.max(0, failoverCfg.failures - 1);
+      log({ event: 'failover_half_open', route: route.prefix, attempt });
+    }
+    const useFallback = Boolean(route?.fallback)
+      && (Date.now() < circuit.openUntil || circuit.failures >= failoverCfg.failures);
+    attemptUsesFallback = useFallback;
+    if (route && lastFailoverChoice !== useFallback) {
+      lastFailoverChoice = useFallback;
+      log({
+        event: useFallback ? 'failover_use_fallback' : 'failover_use_primary',
+        route: route.prefix, attempt,
+        target: (useFallback ? route.fallback.base.href : route.base.href),
+        failures: circuit ? circuit.failures : 0,
+      });
+    }
+    const targetBase = useFallback ? route.fallback.base : (route ? route.base : base);
+    const proxy = useFallback ? (route.fallback.proxy || globalProxy) : (route?.proxy || globalProxy);
     const effectiveRoute = route ? { path: route.path, search: route.search } : ctx.routeFixed;
 
     const target = new URL(targetBase.href);
@@ -381,6 +456,7 @@ export function forwardWithRetry(ctx) {
         || (msg.includes('upstream timeout') ? 'ETIMEDOUT' : undefined)
         || (/EPROTO|handshake/i.test(msg) ? 'EPROTO' : undefined);
       if (attempt < maxAttempts && RETRYABLE_TRANSPORT.has(transportCode) && !res.headersSent) {
+        noteFailure('transport_' + (transportCode || 'unknown'));
         settled = true;
         cleanupFns.forEach((fn) => { try { fn(); } catch {} });
         log({
@@ -452,6 +528,7 @@ export function forwardWithRetry(ctx) {
           // ── Retry decision: only BEFORE the first forwarded byte ──
           const retryableStatus = retryStatuses.has(status);
           if (retryableStatus && attempt < maxAttempts) {
+            noteFailure('status_' + status);
             const waitMs = waitTimeFor(response, attempt);
             // Drain the (likely tiny) error body so the socket can be reused/destroyed cleanly.
             response.resume();
@@ -532,6 +609,7 @@ export function forwardWithRetry(ctx) {
           };
 
           const passThrough = () => {
+            noteSuccess();
             settled = true;
             cleanupFns.splice(0).forEach((fn) => { try { fn(); } catch {} });
             writeHead();
@@ -568,6 +646,7 @@ export function forwardWithRetry(ctx) {
           };
 
           const retryFromStream = (reason) => {
+            noteFailure('stream_' + reason);
             decided = true;
             stopHold();
             cleanupFns.splice(0).forEach((fn) => { try { fn(); } catch {} });
@@ -583,6 +662,7 @@ export function forwardWithRetry(ctx) {
           };
 
           const flushHeld = () => {
+            noteSuccess();
             if (process.env.SHIM_DEBUG_HOLD === '1') process.stderr.write(`[hold] flush decided=${decided} bytes=${heldBytes}\n`);
             if (decided) return;
             decided = true;
@@ -651,21 +731,22 @@ export function forwardWithRetry(ctx) {
       });
   };
 
+  const fastFailoverWait = (ms) => (route?.fallback && !attemptUsesFallback ? Math.min(2000, ms) : ms);
   const waitTime = (attemptNumber) => {
-    if (attemptNumber <= 0) return backoffBase;
+    if (attemptNumber <= 0) return fastFailoverWait(backoffBase);
     const exponential = backoffBase * (2 ** Math.min(attemptNumber - 1, 6));
-    return Math.min(exponential, maxWait);
+    return fastFailoverWait(Math.min(exponential, maxWait));
   };
 
   const waitTimeFor = (response, attemptNumber) => {
     const retryAfter = String(response.headers['retry-after'] || '').trim();
     if (retryAfter) {
       const seconds = Number(retryAfter);
-      if (Number.isFinite(seconds) && seconds >= 0 && seconds <= 3600) return seconds * 1000;
+      if (Number.isFinite(seconds) && seconds >= 0 && seconds <= 3600) return fastFailoverWait(seconds * 1000);
       const date = Date.parse(retryAfter);
       if (!Number.isNaN(date)) {
         const delta = date - Date.now();
-        if (delta > 0 && delta <= 3600000) return delta;
+        if (delta > 0 && delta <= 3600000) return fastFailoverWait(delta);
       }
     }
     return waitTime(attemptNumber);
@@ -761,3 +842,5 @@ function buildHeaders(req, body, changed, bearer, config, target) {
   }
   return headers;
 }
+
+

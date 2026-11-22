@@ -162,6 +162,30 @@ HTTP 层面是 `200`，失败发生在流内部，所以客户端只能看到「
 > 可在 `routes.json` 里为该前缀单独挂代理：
 > `{ "any": { "upstream": "https://anyrouter.top/v1", "proxy": "http://127.0.0.1:10808" } }`
 
+### 主用/备用自动切换（`fallback` + 熔断）
+
+路由条目可选配一个备用上游；主用连续失败达到阈值后自动切到备用，
+冷却期结束再"半开"探测主用，成功即切回：
+
+```json
+{
+  "cf": {
+    "upstream": "https://ai.chatflowsai.com/v1",
+    "fallback": { "upstream": "https://anyrouter.top/v1", "proxy": "http://127.0.0.1:10808" },
+    "failover": { "failures": 3, "cooldownMs": 120000 }
+  }
+}
+```
+
+行为细节：
+- **失败计数**：状态码重试、传输重试、流内错误重试都计一次；
+- **熔断**：连续失败达到 `failures`（默认 3）→ 打开熔断，本请求剩余尝试直接走备用；
+- **快速降级**：在主用上重试时退避被压到最多 2 秒，避免"等 60 秒才切换"；
+- **冷却后半开**：`cooldownMs`（默认 120000）后先试一次主用，成功则清零并切回；
+- **备用成功不治愈主用**：只有主用成功才重置计数（避免备用成功掩盖主用故障）；
+- 日志事件：`failover_open` / `failover_use_fallback` / `failover_half_open` /
+  `failover_use_primary` / `failover_reset`，请求日志新增 `route` 字段。
+
 ### 流内错误重试（`--retry-stream`）
 
 有些网关不返回 HTTP 错误，而是先给 `200`，再在 SSE 里吐一条失败事件，例如：
@@ -289,6 +313,7 @@ git apply /path/to/patches/retry-fixes-v2.patch    # 可选：401/403 瞬时判�
 git apply /path/to/patches/retry-fixes-v3.patch    # 可选：流空闲预算 + 中途断流干净收尾
 git apply /path/to/patches/retry-fixes-v4.patch    # 可选：prompt_cache_key 自动补全
 git apply /path/to/patches/retry-fixes-v5.patch    # 可选：500 容量错误 + TLS EPROTO 重试
+git apply /path/to/patches/retry-fixes-v6.patch    # 可选：主用/备用自动切换（fallback + 熔断）
 ```
 
 ### 验证补丁生效
@@ -361,7 +386,16 @@ git apply /path/to/patches/retry-fixes-v5.patch    # 可选：500 容量错误 +
    - 经 shim（`--ensure-prompt-cache-key` + 该前缀走代理）→ 缺字段也返回 `200`
      （日志 `prompt_cache_key_injected: true`，3.9s）。
 
-9. **图片上限验证**（image-limit-v1）：
+9. **主用/备用切换验证**（retry-fixes-v6，4/4 通过）：
+
+   - 主用连续 500 → 熔断 → 自动切备用（1.2s 内完成）；
+   - 熔断期内请求直接走备用，不再试探主用；
+   - 冷却期（测试用 1.5s）后半开探测主用，主用恢复即切回；
+   - 备用成功不会重置主用熔断状态；
+   - 生产：`/cf` 主用 chatflowsai 实测 `200`（3.0s），日志 `route:"/cf"`、
+     `failover_use_primary`，无降级。
+
+10. **图片上限验证**（image-limit-v1）：
 
    - 单元验证：`node examples/image-limit.mjs`（60 张图 → 保留最新 30 张，10 项检查全过）；
    - 端到端：假上游收到 60 张图的请求 → shim 裁剪后上游实收 30 张 → `200`
@@ -382,7 +416,8 @@ git apply /path/to/patches/retry-fixes-v5.patch    # 可选：500 容量错误 +
 │   ├── retry-fixes-v2.patch    # 在 retry-fixes-v1 之上叠加（401/403 瞬时判定重试 + 超时归类）
 │   ├── retry-fixes-v3.patch    # 在 retry-fixes-v2 之上叠加（流空闲预算 + 中途断流干净收尾）
 │   ├── retry-fixes-v4.patch    # 在 retry-fixes-v3 之上叠加（prompt_cache_key 自动补全）
-│   └── retry-fixes-v5.patch    # 在 retry-fixes-v4 之上叠加（500 容量错误与 TLS EPROTO 也重试）
+│   ├── retry-fixes-v5.patch    # 在 retry-fixes-v4 之上叠加（500 容量错误与 TLS EPROTO 也重试）
+│   └── retry-fixes-v6.patch    # 在 retry-fixes-v5 之上叠加（主用/备用自动切换 + 熔断）
 ├── src-patched/
 │   ├── sanitize.mjs            # 打好补丁的完整文件（可直接覆盖）
 │   ├── server.mjs              # 打好补丁的完整文件（可直接覆盖）

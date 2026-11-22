@@ -284,6 +284,7 @@ export function createShimServer(options = {}) {
     try {
       const route = routeRequest(req, config);
       event.path = route.path;
+      event.route = route.routePrefix || null;
       if (route.health) {
         sendJSON(res, 200, { status: 'ok', version: VERSION, mode: config.mode, strict: config.strict });
         return;
@@ -326,6 +327,8 @@ export function createShimServer(options = {}) {
             prefix: routeEntry.prefix,
             base: routeEntry.base,
             proxy: routeEntry.proxy,
+            fallback: routeEntry.fallback,
+            failover: routeEntry.failover,
             path: route.path,
             search: route.search,
           } : null,
@@ -367,6 +370,7 @@ export function createShimServer(options = {}) {
   });
   return server;
 }
+
 
 
 
