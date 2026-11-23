@@ -1,0 +1,63 @@
+diff --git a/src/retry-routing.mjs b/src/retry-routing.mjs
+index d4b7142..8da62d7 100644
+--- a/src/retry-routing.mjs
++++ b/src/retry-routing.mjs
+@@ -168,12 +168,22 @@ function loadRoutes(file) {
+       failures: Number(entry.failover?.failures) > 0 ? Number(entry.failover.failures) : 3,
+       cooldownMs: Number(entry.failover?.cooldownMs) > 0 ? Number(entry.failover.cooldownMs) : 120000,
+     };
++    // Per-route budget overrides: slow upstreams (long prompts) need a much
++    // larger header timeout than fast ones, and fewer retries to stay inside
++    // the client's first-byte budget.
++    const budget = {
++      timeoutMs: Number(entry.timeoutMs) > 0 ? Number(entry.timeoutMs) : null,
++      retries: Number.isFinite(Number(entry.retries)) && Number(entry.retries) >= 0 ? Number(entry.retries) : null,
++      backoffMs: Number(entry.backoffMs) > 0 ? Number(entry.backoffMs) : null,
++      maxWaitMs: Number(entry.maxWaitMs) > 0 ? Number(entry.maxWaitMs) : null,
++    };
+     routes.set(`/${prefix}`, {
+       prefix: `/${prefix}`,
+       base: upstream, // URL, pathname already as given (trailing slash stripped below)
+       proxy,
+       fallback,
+       failover,
++      budget,
+     });
+     const record = routes.get(`/${prefix}`);
+     record.base.pathname = record.base.pathname.replace(/\/+$/, '');
+@@ -361,9 +371,11 @@ export function forwardWithRetry(ctx) {
+     log,
+   } = ctx;
+ 
+-  const maxAttempts = 1 + Math.max(0, retry.retry429);
+-  const backoffBase = retry.retryBackoffMs;
+-  const maxWait = retry.retryMaxWaitMs;
++  const budget = route?.budget || {};
++  const maxAttempts = 1 + Math.max(0, budget.retries != null ? budget.retries : retry.retry429);
++  const backoffBase = budget.backoffMs || retry.retryBackoffMs;
++  const maxWait = budget.maxWaitMs || retry.retryMaxWaitMs;
++  const attemptTimeoutMs = budget.timeoutMs || config.timeoutMs;
+   const retryStatuses = new Set(retry.retryStatuses && retry.retryStatuses.length
+     ? retry.retryStatuses : [429, 502, 503, 504]);
+   const retryStream = Boolean(retry.retryStream);
+@@ -485,7 +497,7 @@ export function forwardWithRetry(ctx) {
+       }
+     };
+ 
+-    createUpstreamRequest(target, { method: req.method, timeoutMs: config.timeoutMs, proxy }, headers,
++    createUpstreamRequest(target, { method: req.method, timeoutMs: attemptTimeoutMs, proxy }, headers,
+       (setupError, outgoing, rawSocket) => {
+         if (setupError) {
+           // Proxy CONNECT failure counts as a retryable transport error.
+@@ -500,9 +512,9 @@ export function forwardWithRetry(ctx) {
+         if (rawSocket) cleanupFns.push(() => { try { rawSocket.destroy(); } catch {} });
+ 
+         const timeout = () => { const e = new Error('upstream timeout'); e.code = 'ETIMEDOUT'; outgoing.destroy(e); };
+-        const headerTimer = setTimeout(timeout, config.timeoutMs);
++        const headerTimer = setTimeout(timeout, attemptTimeoutMs);
+         headerTimer.unref();
+-        outgoing.setTimeout(config.timeoutMs, timeout);
++        outgoing.setTimeout(attemptTimeoutMs, timeout);
+         cleanupFns.push(() => clearTimeout(headerTimer));
+ 
+         let incoming = null;

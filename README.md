@@ -181,6 +181,13 @@ HTTP 层面是 `200`，失败发生在流内部，所以客户端只能看到「
 - **失败计数**：状态码重试、传输重试、流内错误重试都计一次；
 - **熔断**：连续失败达到 `failures`（默认 3）→ 打开熔断，本请求剩余尝试直接走备用；
 - **快速降级**：在主用上重试时退避被压到最多 2 秒，避免"等 60 秒才切换"；
+- **每路由超时/重试预算**：慢上游（长 prompt、首字节几十秒）可单独放大
+  `timeoutMs`，并减少 `retries`，避免"45 秒首字节超时"把大请求误杀成 502：
+  ```json
+  "cf": { "upstream": "https://...", "timeoutMs": 130000, "retries": 1, "backoffMs": 5000 }
+  ```
+  总预算需小于客户端首字节超时（cc-switch 默认 300s）；
+
 - **冷却后半开**：`cooldownMs`（默认 120000）后先试一次主用，成功则清零并切回；
 - **备用成功不治愈主用**：只有主用成功才重置计数（避免备用成功掩盖主用故障）；
 - 日志事件：`failover_open` / `failover_use_fallback` / `failover_half_open` /
@@ -314,6 +321,7 @@ git apply /path/to/patches/retry-fixes-v3.patch    # 可选：流空闲预算 + 
 git apply /path/to/patches/retry-fixes-v4.patch    # 可选：prompt_cache_key 自动补全
 git apply /path/to/patches/retry-fixes-v5.patch    # 可选：500 容量错误 + TLS EPROTO 重试
 git apply /path/to/patches/retry-fixes-v6.patch    # 可选：主用/备用自动切换（fallback + 熔断）
+git apply /path/to/patches/retry-fixes-v7.patch    # 可选：每路由超时/重试预算
 ```
 
 ### 验证补丁生效
@@ -395,7 +403,16 @@ git apply /path/to/patches/retry-fixes-v6.patch    # 可选：主用/备用自�
    - 生产：`/cf` 主用 chatflowsai 实测 `200`（3.0s），日志 `route:"/cf"`、
      `failover_use_primary`，无降级。
 
-10. **图片上限验证**（image-limit-v1）：
+10. **慢上游超时预算验证**（retry-fixes-v7）：
+
+    - 现象：chatflowsai `/v1/responses` 小请求约 27s、大 prompt 常 60s+ 才回首字节；
+      全局 `--timeout 45000` 会把它误杀成 502，然后降级到同样慢的 any → 连续 502；
+    - 修复：`cf`/`any` 路由单独设 `timeoutMs: 130000, retries: 1, backoffMs: 5000`
+      （最坏 130+5+130 ≈ 265s，仍在 cc-switch 300s 首字节窗口内）；
+    - 实测：全链路 `15721 → shim → chatflowsai` `200`，耗时 32s，日志 `route:"/cf"`、
+      `failover_use_primary`。
+
+11. **图片上限验证**（image-limit-v1）：
 
    - 单元验证：`node examples/image-limit.mjs`（60 张图 → 保留最新 30 张，10 项检查全过）；
    - 端到端：假上游收到 60 张图的请求 → shim 裁剪后上游实收 30 张 → `200`
@@ -417,7 +434,8 @@ git apply /path/to/patches/retry-fixes-v6.patch    # 可选：主用/备用自�
 │   ├── retry-fixes-v3.patch    # 在 retry-fixes-v2 之上叠加（流空闲预算 + 中途断流干净收尾）
 │   ├── retry-fixes-v4.patch    # 在 retry-fixes-v3 之上叠加（prompt_cache_key 自动补全）
 │   ├── retry-fixes-v5.patch    # 在 retry-fixes-v4 之上叠加（500 容量错误与 TLS EPROTO 也重试）
-│   └── retry-fixes-v6.patch    # 在 retry-fixes-v5 之上叠加（主用/备用自动切换 + 熔断）
+│   ├── retry-fixes-v6.patch    # 在 retry-fixes-v5 之上叠加（主用/备用自动切换 + 熔断）
+│   └── retry-fixes-v7.patch    # 在 retry-fixes-v6 之上叠加（每路由超时/重试预算）
 ├── src-patched/
 │   ├── sanitize.mjs            # 打好补丁的完整文件（可直接覆盖）
 │   ├── server.mjs              # 打好补丁的完整文件（可直接覆盖）
